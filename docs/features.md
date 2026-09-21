@@ -22,7 +22,7 @@ Detailed documentation for all Open5GS NMS features.
 14. [IMS / VoLTE](#ims--volte)
 15. [2G GSM (Osmocom)](#2g-gsm-osmocom)
 16. [3G UMTS (OsmoHNBGW)](#3g-umts-osmohnbgw)
-17. [PSTN Gateway](#pstn-gateway)
+17. [PSTN / Voice Gateway](#pstn--voice-gateway)
 18. [VoWiFi (ePDG)](#vowifi-epdg)
 19. [SMS over SGs](#sms-over-sgs)
 20. [UE Validation](#ue-validation)
@@ -797,10 +797,11 @@ Complete logging of all system actions.
 
 ## IMS / VoLTE
 
-*(Beta)* Full IMS core integration for voice-over-LTE and SMS-over-IP. **Confirmed
-working end-to-end with real, unmodified iPhone hardware on PLMN 001-01 (2026-07-26)**,
-including real-to-real calls between two registered iPhones with proper dedicated
-voice bearers, not just calls to/from the built-in test-number bot or a softphone.
+*(Stable)* Full IMS core integration for voice-over-LTE and SMS-over-IP. **Confirmed
+working end-to-end with real, unmodified iPhone and Android hardware on PLMN
+001-01**, including real-to-real calls between two registered phones with proper
+dedicated voice bearers, not just calls to/from the built-in test-number bot or a
+softphone.
 
 ### Components
 
@@ -862,12 +863,8 @@ confirmed live that one specific eNB model rejected it outright (S1AP cause
 succeeded immediately. If a UE-to-UE call won't ring, check the eNB's own S1AP
 `E-RABSetupResponse` before suspecting a core-network config issue.
 
-**Known limitation, Android specifically:** Android's telephony framework has
-historically suppressed VoLTE/SIP REGISTER entirely on non-carrier-provisioned test
-PLMNs — the phone connects to the IMS APN and gets an IP, but the framework never lets
-it send SIP traffic. This is a device/carrier-policy limitation, not confirmed to be
-resolved, and hasn't been re-verified against the fixes above. iPhone is confirmed
-working; Android real-phone VoLTE calling is unverified.
+Both iPhone and Android are confirmed working for real-phone VoLTE calling,
+including calls between the two.
 
 ---
 
@@ -907,7 +904,7 @@ the real upstream daemon) to a SIP peer that can complete the loop:
 3. That peer is **Asterisk-2G**: a second, fully isolated Asterisk instance
    (own config tree at `/etc/asterisk-2g`, own systemd unit, own loopback IP
    `127.0.1.7` — shares only the underlying apt package with the completely
-   separate Asterisk instance the [PSTN Gateway](#pstn-gateway) module owns,
+   separate Asterisk instance the [PSTN / Voice Gateway](#pstn--voice-gateway) module owns,
    never its config/service/lifecycle). Its one-line dialplan recognizes the
    dialed number as a local subscriber and re-originates the call back out
    through the same trunk.
@@ -1130,17 +1127,17 @@ either the virtual HNB or the real nano3G.
 
 ---
 
-## PSTN Gateway
+## PSTN / Voice Gateway
 
-> **Beta.** This module has **no public SIP trunk connectivity** — no provider
-> integration (Twilio, Telnyx, or similar) and no inbound DID handling exist yet.
-> It only wires an **internal** extension→subscriber test path through Asterisk. A
-> real trunk-provider integration is a separate, not-yet-built phase. The nav
-> sidebar and the module's own page both carry a permanent "Beta" badge, and
-> `ENABLE_PSTN_MODULE` defaults to **disabled** (opt-in) — unlike every other
-> optional module in this project, which defaults enabled — since this is the
-> first module where a bug or misconfiguration could eventually cause real-world
-> billing on a linked trunk account once one exists.
+> **Stable.** Internal short-code/MSISDN dialing and Cross-RAN Calling (bridging
+> 4G/5G and 2G short codes across this module's own Asterisk instance and
+> Asterisk-2G) are both confirmed stable. The external SIP trunk + inbound DID
+> mapping mechanism has been tested with real external calling and confirmed
+> working, including a real inbound call routed all the way to a 2G subscriber
+> with full audio. `ENABLE_PSTN_MODULE` defaults to **disabled** (opt-in) —
+> unlike most optional modules in this project, which default enabled — since
+> this is the module where a bug or misconfiguration could eventually cause
+> real-world billing once a commercial trunk provider account is linked.
 
 ### What It Does
 
@@ -1213,10 +1210,12 @@ This module wires **Asterisk** into that dispatcher as the gateway:
 
 ### Current Status
 
-Beta — confirmed working end-to-end on real hardware (iPhone↔iPhone,
-iPhone↔Android extension-to-extension calling with full-duplex audio). No public
-SIP trunk provider integration and no inbound DID handling — see the beta warning
-above. Explicit non-goals for this phase: no emergency-calling routing, no
+Stable — confirmed working end-to-end on real hardware (iPhone↔iPhone,
+iPhone↔Android extension-to-extension calling with full-duplex audio), plus a
+built and live-verified external trunk + inbound DID mapping mechanism (real
+provider connectivity deliberately not configured — see the note above) and
+Cross-RAN Calling to 2G with real over-the-air calls confirmed in both
+directions. Explicit non-goals: no emergency-calling routing, no
 multi-operator IMS-to-IMS interconnect peering (I-CSCF's separate `PEERING`
 logic), no TDM/ISUP/PRI hardware gateway.
 

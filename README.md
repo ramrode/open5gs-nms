@@ -21,7 +21,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Safe Configuration** - Automatic backups, validation, and rollback on failure
 - **5G Privacy (SUCI)** - Home network key management for subscription concealment
 - **Authentication** - Session-based login protecting all pages and API endpoints
-- **Voice & SMS** - Optional IMS/VoLTE core (beta — real iPhone-to-iPhone calling confirmed working) and SGs-based SMS, both provisioned and managed from the UI
+- **Voice & SMS** - Optional IMS/VoLTE core (stable — real iPhone-to-iPhone calling confirmed working) and SGs-based SMS, both provisioned and managed from the UI
 - **L3 Routing (FRR)** - Guided L2→L3 migration, EIGRP/OSPF/BGP support, and a from-source FRR reinstall path
 - **End-to-End Testing** - Simulated 4G/5G test UEs (UE Validation) to verify attach/PDU/paging without a physical radio
 
@@ -59,6 +59,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Configurable resolution** — 5 minute, 15 minute, or 1 hour buckets, plus a flexible time-range picker
 - **Live latest-rate readout** — current Up/Down Mbps shown alongside the chart
 - **Built on the existing Prometheus, not a second time-series store** — reuses the already-deployed Prometheus stack's own `rate()` computation over raw cumulative byte counters exposed by the backend's own `/metrics` endpoint, so retention matches whatever Prometheus is already configured for
+- An earlier version of this feature built its own MongoDB-backed time-series store for this data; it was replaced once it became clear Prometheus was already deployed and already doing the job
 
 ![Traffic History](docs/screenshots/traffic-history.png)
 
@@ -122,7 +123,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 ![Service Management](docs/screenshots/service-management.png)
 
 ### Auto-Configuration Wizard
-- **One-Click Setup** — Generate all 16 NF configurations from minimal input (PLMN, host IPs, UE subnets)
+- **One-Click Setup** — Generate all 17 NF configurations from minimal input (PLMN, host IPs, UE subnets)
 - **Preview Changes** — YAML diff viewer shows exact changes before applying
 - **Persistent NAT** — iptables rules saved via `netfilter-persistent` and IP forwarding via `sysctl.d` — survive reboots
 
@@ -317,20 +318,20 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ![Syslog Forwarding](docs/screenshots/syslog-forwarding-modal.png)
 
-### IMS / VoLTE *(Beta)*
-
-> ⚠️ **This module is in beta.** Real UE-to-UE VoLTE calling is confirmed working end-to-end on real iPhone hardware (PLMN 001-01) — dedicated QCI=1 voice bearers, RTP audio, the works. Android VoLTE support is still in progress and does not work yet. Manual configuration beyond what this page automates may still be needed for other device/carrier combinations.
+### IMS / VoLTE
 
 - **Full IMS core integration** — P-CSCF/I-CSCF/S-CSCF (Kamailio 5.8.8, built with IMS/TLS/MySQL/extra modules), PyHSS Diameter HSS, BIND9 DNS, RTPEngine, MariaDB
 - **One-click install** of every IMS component, including PyHSS ([nickvsnetworking/pyhss](https://github.com/nickvsnetworking/pyhss)), cloned and set up automatically — no separate manual install required
 - **Guided configuration** — wires the P-CSCF address into SMF's PCO and per-session DNS, writes the Cx/Rx Diameter peer XML, and generates the IMS DNS zone automatically
 - **Subscriber sync** — pushes IMPI/IMPU identities for your existing subscribers into PyHSS's HSS database
-- **Real-phone VoLTE confirmed** — two real, registered iPhones calling each other rings and connects with full audio, including a real P-CSCF↔PCRF Rx interface for dedicated QCI=1 bearers, on PLMN 001-01
-- **Known limitation** — Android VoLTE support is still in progress and not yet confirmed working
+- **Real-phone VoLTE confirmed** — real, registered iPhones and Android phones calling each other rings and connects with full audio, including a real P-CSCF↔PCRF Rx interface for dedicated QCI=1 bearers, on PLMN 001-01
 
 ![IMS Configuration](docs/screenshots/ims-config.png)
 
 ### SMS over SGs *(Beta)*
+
+> ⚠️ **SMS over IMS (part of the IMS/VoLTE module above) is the default, primary SMS path and is stable** — real phones prefer it whenever IMS-registered anyway. This module is an opt-in, experimental alternative for deployments without IMS. Real two-UE SGs delivery has an open, unresolved bug (P-CSCF failing to relay a locally-generated reply back through the IPsec tunnel) — test carefully before relying on SGs delivery mode for real subscriber SMS.
+
 - **Osmocom CS-fallback SMS stack** — `osmo-stp` + `osmo-hlr` + `osmo-msc`, connected to the MME via the SGs interface, for SMS delivery without any IMS/VoLTE deployment
 - **One-click install** — packages, service lifecycle (start/stop/restart/enable/disable), and subscriber sync all from the UI
 - **Config file editor** — Monaco-based editor for all three Osmocom `.cfg` files with per-file save and save-and-restart
@@ -368,7 +369,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ![VoWiFi Live Sessions](docs/screenshots/vowifi-live-sessions.png)
 
-### UE Validation *(Beta)*
+### UE Validation
 - **Simulated test UEs** — spin up a 4G (srsRAN) or 5G (UERANSIM) test UE against your live core, no physical radio needed
 - **End-to-end validation** — confirms attach, PDU session establishment, and idle-mode paging/wake all the way down to actual bidirectional traffic
 - **Live log tailing & raw log download**, with session state that survives an NMS backend restart
@@ -380,9 +381,9 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ---
 
-### PSTN Gateway *(Beta)*
+### PSTN / Voice Gateway
 
-> ⚠️ **This module has no public SIP trunk connectivity yet** — no provider integration and no inbound DID handling by default (an optional external trunk + DID mapping phase exists but real provider connectivity is deliberately deferred). `ENABLE_PSTN_MODULE` defaults **disabled** (opt-in) — unlike most optional modules, which default enabled.
+> ⚠️ **No public SIP trunk provider connected yet** — the external trunk + inbound DID mapping mechanism itself is built and live-verified, but real provider connectivity (Twilio, Telnyx, or similar) is deliberately not configured on this deployment, since there's nothing to connect to. `ENABLE_PSTN_MODULE` defaults **disabled** (opt-in) — unlike most optional modules, which default enabled.
 
 - **Wires Asterisk into S-CSCF's own PSTN dispatcher** for internal extension-to-subscriber calling, confirmed working end-to-end on real hardware (iPhone↔iPhone, iPhone↔Android) with full-duplex audio
 - **Every subscriber's own real MSISDN is internally dialable**, auto-routed to IMS or 2G by their own `gsmEnabled` flag, alongside their existing extension short codes
@@ -406,16 +407,6 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - Reuses the 2G module's existing subscriber provisioning — no new credential setup needed for a subscriber to also work on 3G
 - A software test HNB (OsmoHNodeB) is deployable from the module's own page — proved a full live registration end-to-end before any real 3G hardware was ever touched
 - Real hardware target: an ip.access nano3G, which self-registers once pointed at this gateway (no remote-provisioning push, unlike 2G's OML)
-
-### Security Gateway (SecGW) *(Alpha — Experimental)*
-
-> ⚠️ **Alpha.** Real IPsec tunnels confirmed live, but this touches live radio traffic paths — verify carefully on your own hardware before relying on it.
-
-- **Real IPsec tunnels for CBRS radios**, confirmed live simultaneously for two different vendors with fundamentally different IPsec models: 3 Baicells eNBs (IKEv2 Configuration Payload / virtual-IP based) and 1 Nokia AirScale (static tunnel endpoints + traffic selectors — Nokia has no Configuration Payload support at all)
-- **Real S1AP/GTP-U traffic verified flowing through the tunnel** via packet capture — ESP wrapper, decrypted SCTP heartbeat to MME
-- **Per-radio dedicated pool addresses**, never a shared CIDR — a shared selector setup caused a real outage (last-negotiating radio silently stole the kernel XFRM policy slot from the others)
-- Nokia radios needing to reach anything beyond the auto-derived core NF pair (e.g. the DNS server) get it via an explicit `extraLocalCidrs` "Protect" policy, matched by widening this gateway's own local traffic selector
-- `ENABLE_SECGW_MODULE` defaults **disabled** (opt-in)
 
 ### RF Planning *(Alpha)*
 
@@ -470,22 +461,6 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Phase 2 (Asterisk-2G)** — code deployed, but a real end-to-end test-call confirmation is still outstanding
 - **Phase 3 (direct 4G/5G IMS-to-IMS calls)** — via Kamailio's own `acc` module, confirmed fully working end-to-end against real test calls, independent runtime toggle from its own compile-time build flag
 - Configurable retention (default 180 days)
-
-### Traffic History *(Stable)*
-
-- **Aggregate and per-subscriber bandwidth history**, built entirely on this project's already-deployed Prometheus stack rather than a second time-series database — an earlier version of this feature built its own MongoDB store; it was replaced once the team realized Prometheus was already deployed and already doing the job
-- Real cumulative counters exposed via the NMS backend's own `/metrics` endpoint, scraped alongside every core NF
-- Retention is whatever Prometheus's own retention window is set to (shared with NF metrics), not independently configurable per feature
-
-### UE Signal Monitoring *(New — Community Contributed)*
-
-> New in PR #32. **Baicells-native connector only** — other vendors need a generic JSON connector, which requires the radio to already expose its own metrics in that shape, so this is not a drop-in for every vendor.
-
-- **Per-UE RSRP/RSRQ/SINR/BLER/MCS/CQI/throughput**, correlated with subscriber identity (IMSI/ICCID/MSISDN)
-- **7-day SQLite history** per UE
-- **AES-256-GCM encrypted radio credentials**
-- **Admin-triggered downlink wake** for idle UEs, so a signal sample can be captured on demand
-- `ENABLE_UE_SIGNAL_MODULE` defaults **enabled** — a visibility gate, not an install/uninstall lifecycle like most other opt-in modules
 
 ---
 
@@ -763,35 +738,8 @@ For detailed development instructions, see **[docs/development.md](docs/developm
 
 ## 📝 Changelog
 
-See **[CHANGELOG.md](CHANGELOG.md)** for a complete version history.
-
-### Latest Release: v2.0-beta_0.47 (2026-08-14)
-
-**🆕 New Module: Security Gateway (SecGW)**
-- IPsec termination for real RAN backhaul (S1-MME/S1-U, N2/N3) — confirmed live for
-  both Baicells and Nokia radios simultaneously, real S1AP/GTP-U traffic verified
-  flowing through the tunnel via packet capture
-- Vendor-split Radios tab (Baicells / Nokia), since the two vendors' IPsec models are
-  fundamentally different — Baicells negotiates a virtual IP dynamically via IKEv2
-  Configuration Payload, Nokia uses static tunnel endpoints and explicit traffic
-  selectors with no CP support at all
-- Per-radio dedicated pool addresses, an "Additional Protected Destinations" field for
-  radios needing to reach more than the core NF pair, and downloadable connection-info
-  bundles that use each vendor's own field names and terminology
-- `ENABLE_SECGW_MODULE` defaults **disabled** (opt-in)
-
-**🛠️ Fixes**
-- VoWiFi's Setup tab no longer shows a first-run "Run Install" prompt once already
-  installed, matching the fix already applied to SecGW's own Setup tab — audited every
-  other install-flow page in the app and confirmed none of the others had this bug
-- A phantom `nms-btn-secondary` CSS class (referenced in 5 places, never actually
-  defined) meant those buttons rendered with no styling at all — fixed, along with
-  three more of the same class of bug (`nms-accent-hover`, `nms-surface-1`,
-  `nms-text-secondary`, all referenced but undefined Tailwind color tokens) and a
-  missing `nms-checkbox` style that had left every checkbox in the app as an unstyled
-  native browser checkbox
-
-See **[CHANGELOG.md](CHANGELOG.md)** for the full history.
+See **[CHANGELOG.md](CHANGELOG.md)** for a complete version history, including the
+latest release.
 
 ---
 
