@@ -6,7 +6,10 @@ import { Collection, MongoClient } from 'mongodb';
 import pino from 'pino';
 import { IAuditLogger } from '../../domain/interfaces/audit-logger';
 import { ISubscriberRepository } from '../../domain/interfaces/subscriber-repository';
+import { IHostExecutor } from '../../domain/interfaces/host-executor';
 import { requireAdmin } from './middleware/auth-middleware';
+import { applyExternalTrunkFirewall, removeExternalTrunkFirewall } from '../../application/use-cases/pstn/pstn-external-trunk-firewall';
+import { createDummyInterface, deleteDummyInterface } from '../../infrastructure/network/dummy-interface';
 import { getAppVersion } from '../../infrastructure/system/app-version';
 import {
   isAsterisk2gInstalled, setCrossRanPeer, listGsm2gShortCodesForCrossRan,
@@ -65,7 +68,45 @@ const ASTERISK_PORT = 5060;
 // 3-digit code can't collide with one either.
 const DEFAULT_ECHO_TEST_NUMBER = '500';
 
-interface PstnState {
+// A real external SIP trunk to a third-party Asterisk server with real
+// PSTN/DID connectivity. Unlike every other peer this module has (all pure
+// loopback, 127.0.1.x), this one needs a real, non-loopback, provider-
+// reachable bind address — an operator-configurable field, matching this
+// project's established convention of an explicit IP input rather than
+// auto-detection (there's no reliable way to guess which of a host's real
+// interfaces a given provider expects to reach). Plain UDP + an IP
+// allowlist (see pstn-external-trunk-firewall.ts), deliberately not SIP-
+// TLS/SRTP — no existing precedent for that anywhere in this codebase.
+// Same dummy-interface convention as every other outward-facing module
+// (SecGW/VoWiFi/etc. via dummy-interface.ts's createDummyInterface()) —
+// added 2026-09-19 after the first real deployment needed bindIp created by
+// hand (ip link add + a live EIGRP network statement) with no app support
+// for either, which a fresh `git pull` + Configure would NOT have
+// reproduced. 'dummy' mode now creates and persists the interface itself;
+// 'existing' mode (an operator's own real interface) skips that, matching
+// SecGW's exact same two-mode split.
+const DUMMY_IF_NAME_EXT = 'dummy-pstn-ext';
+
+export interface PstnExternalTrunkConfig {
+  enabled: boolean;
+  bindIp: string;
+  bindPort: number;
+  interfaceMode: 'dummy' | 'existing';
+  // Only needed if this host sits behind NAT relative to the provider —
+  // mirrors transport-trunk's own bind-vs-external_media_address split
+  // above. Defaults to bindIp when unset.
+  externalMediaAddress?: string;
+  providerHost: string;
+  providerPort: number;
+  // Trust boundary for both the PJSIP type=identify match= AND the
+  // nftables allowlist (pstn-external-trunk-firewall.ts) — the SAME value
+  // drives both, so they can never drift apart. Defaults to
+  // `${providerHost}/32` if left blank; widen to a real CIDR block if the
+  // provider sends from a range rather than one fixed IP.
+  providerCidr: string;
+}
+
+export interface PstnState {
   asteriskIp: string;
   // Exact-match dialplan extension for a local Answer()/Echo()/Hangup() test
   // — dial it from any IMS-registered phone (VoLTE or VoWiFi) to hear your
@@ -85,6 +126,11 @@ interface PstnState {
   // and setCrossRanCalling() below writes. See CLAUDE.md's Cross-RAN Calling
   // entry for the full design.
   crossRanEnabled?: boolean;
+  // The real external SIP trunk — see PstnExternalTrunkConfig's own comment.
+  // Absent entirely on a deployment that's never configured one (not just
+  // `enabled: false`), so `externalTrunk?.enabled` is the correct check
+  // everywhere, matching this field's own optionality.
+  externalTrunk?: PstnExternalTrunkConfig;
 }
 
 export function readPstnState(): PstnState | null {
@@ -92,7 +138,7 @@ export function readPstnState(): PstnState | null {
   try { return JSON.parse(fs.readFileSync(HOST_PSTN_STATE, 'utf-8')); } catch { return null; }
 }
 
-function writePstnState(state: PstnState): void {
+export function writePstnState(state: PstnState): void {
   fs.mkdirSync(`${HOST_ROOT}/etc/open5gs`, { recursive: true });
   fs.writeFileSync(HOST_PSTN_STATE, JSON.stringify(state, null, 2), 'utf-8');
 }
@@ -182,9 +228,93 @@ async function withExtensions<T>(mongoUri: string, fn: (col: Collection<PstnExte
   }
 }
 
+// A real, external DID (Direct Inward Dialing number) ringing a subscriber
+// on any RAN tech (see externalInboundDialplanConf() below for the inbound
+// routing side). Inbound-only by design — same shape/validation as
+// PstnExtension (reuses EXTENSION_INPUT_RE/normalizeExtension as-is, no new
+// regex needed) but a genuinely separate collection and dialplan namespace
+// (see externalInboundDialplanConf()'s own comment for why), not a variant
+// of PstnExtension. A DID must be unique; a subscriber may have zero, one,
+// or several DIDs — there's no "one DID per subscriber" constraint, since a
+// subscriber can legitimately be reachable via several different real
+// numbers. Briefly (2026-09-19) this collection was ALSO the source for
+// outbound caller ID, on the assumption a subscriber only ever needs one
+// identity in both directions — reverted the same day once real testing
+// showed operators need independent control (e.g. several inbound DIDs
+// ringing one subscriber, but a specific different number presented
+// outbound) — see OutboundCallerId below for that now-separate concern.
+export interface DidMapping {
+  did: string;
+  subscriberImsi: string;
+  label?: string;
+  createdAt: string;
+}
+
+function getDidMappingsCollection(mongoUri: string): { client: MongoClient; collection: Collection<DidMapping> } {
+  const client = new MongoClient(mongoUri);
+  return { client, collection: client.db('open5gs').collection<DidMapping>('pstn_did_mappings') };
+}
+
+async function withDidMappings<T>(mongoUri: string, fn: (col: Collection<DidMapping>) => Promise<T>): Promise<T> {
+  const { client, collection } = getDidMappingsCollection(mongoUri);
+  try {
+    await client.connect();
+    return await fn(collection);
+  } finally {
+    await client.close();
+  }
+}
+
+// The caller ID a subscriber presents on OUTBOUND external-trunk calls —
+// independent of (and, unlike DidMapping, deliberately 1:1 with) their
+// inbound DID(s). Real-world requirement found live (2026-09-19): the
+// external provider only routes an outbound call whose caller ID matches a
+// DID it recognizes, so this needs to be assignable on its own, not just
+// inferred from whichever inbound DID a subscriber happens to have. A
+// subscriber with no entry here still dials out fine, presenting their
+// real MSISDN instead (see syncOutboundCallerIdLookupTable()'s own
+// fallback). Uniqueness is on subscriberImsi (one active outbound identity
+// per subscriber), not on callerId — unlike DidMapping, nothing requires
+// this value to be unique across subscribers or to match any of their own
+// inbound DIDs, since some providers allow presenting any assigned number.
+export interface OutboundCallerId {
+  subscriberImsi: string;
+  callerId: string;
+  label?: string;
+  createdAt: string;
+}
+
+function getOutboundCallerIdsCollection(mongoUri: string): { client: MongoClient; collection: Collection<OutboundCallerId> } {
+  const client = new MongoClient(mongoUri);
+  return { client, collection: client.db('open5gs').collection<OutboundCallerId>('pstn_outbound_caller_ids') };
+}
+
+async function withOutboundCallerIds<T>(mongoUri: string, fn: (col: Collection<OutboundCallerId>) => Promise<T>): Promise<T> {
+  const { client, collection } = getOutboundCallerIdsCollection(mongoUri);
+  try {
+    await client.connect();
+    return await fn(collection);
+  } finally {
+    await client.close();
+  }
+}
+
 // ── Asterisk config generation ──────────────────────────────────────────────
 
-function pjsipPstnConf(asteriskIp: string, icscfIp: string, icscfPort: number, scscfIp: string, mediaIp: string, crossRanPeer: { ip: string; port: number } | null): string {
+interface PstnCoreWiring {
+  icscfIp: string;
+  icscfPort: number;
+  scscfIp: string;
+  mediaIp: string;
+}
+interface PstnPeers {
+  crossRan: { ip: string; port: number } | null;
+  external: PstnExternalTrunkConfig | null;
+}
+
+function pjsipPstnConf(asteriskIp: string, core: PstnCoreWiring, peers: PstnPeers): string {
+  const { icscfIp, icscfPort, scscfIp, mediaIp } = core;
+  const crossRanPeer = peers.crossRan;
   // Cross-RAN Calling: peers with Asterisk-2G's own instance so a call to a
   // 2G short code can be dialed from this side and vice versa. Written/
   // removed only by setCrossRanCalling() below. Reuses transport-trunk (a
@@ -222,6 +352,52 @@ direct_media=no
 trust_id_inbound=yes
 asymmetric_rtp_codec=yes
 codec_prefs_outgoing_offer=prefer:pending,operation:intersect,keep:all,transcode:allow
+rtp_symmetric=yes
+force_rport=yes
+rewrite_contact=yes
+rtp_keepalive=5
+` : '';
+  // The real external trunk — a genuinely new bind (transport-external),
+  // not shared with transport-trunk above, since every other peer here is
+  // loopback-only and this one has to be reachable off-host. codecs are
+  // deliberately ulaw/alaw ONLY, not amrwb/amr: this leg's job is speaking
+  // to a real PSTN-style provider that will never negotiate AMR anyway —
+  // transcoding already happens because the call's OTHER leg (scscf_trunk
+  // or asterisk2g_trunk) is what offers AMR. Same B2BUA hardening
+  // (direct_media=no/rtp_symmetric=yes/rtp_keepalive=5) as every other
+  // trunk here — see CLAUDE.md pattern #14 on budgeting for this on any
+  // new B2BUA-style peer. Network-layer trust (nftables allowlist on
+  // providerCidr, see pstn-external-trunk-firewall.ts) is the PRIMARY
+  // defense for this peer, since — unlike scscf_trunk/asterisk2g_trunk —
+  // its match= boundary is reachable from off-host at all.
+  const external = peers.external;
+  const externalBlock = external?.enabled ? `
+[transport-external]
+type=transport
+protocol=udp
+bind=${external.bindIp}:${external.bindPort}
+external_media_address=${external.externalMediaAddress || external.bindIp}
+
+[external_trunk]
+type=identify
+endpoint=external_trunk
+match=${external.providerCidr}
+
+[external_trunk]
+type=aor
+contact=sip:${external.providerHost}:${external.providerPort}
+
+[external_trunk]
+type=endpoint
+context=pstn-external-inbound
+disallow=all
+allow=ulaw
+allow=alaw
+aors=external_trunk
+transport=transport-external
+direct_media=no
+trust_id_inbound=yes
+asymmetric_rtp_codec=yes
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
@@ -331,7 +507,7 @@ rewrite_contact=yes
 ; each end) has nothing to ever retry it without this. Matches a documented
 ; Asterisk community fix for the identical simple_bridge/no-audio symptom.
 rtp_keepalive=5
-${crossRanBlock}`;
+${crossRanBlock}${externalBlock}`;
 }
 
 // One literal extension per mapping — matches this project's usual "regenerate
@@ -339,7 +515,31 @@ ${crossRanBlock}`;
 // could move this to Asterisk Realtime (ODBC-backed dialplan lookup) to avoid
 // a reload on every single mapping change — noted in the PSTN plan, not done
 // here since a reload is cheap and this list is expected to stay small.
-function extensionsPstnConf(imsDomain: string, extensions: PstnExtension[], echoTestNumber: string, crossRanPeerCodes: { extension: string; label?: string }[]): string {
+// A subscriber's own real MSISDN, auto-dialable internally alongside
+// (never instead of) any PstnExtension short code they may also have.
+// `extension` is the digit string a caller actually dials -- for a
+// non-gsm subscriber this is informational only (the real Dial() target is
+// subscriberImsi via scscf_trunk); for a gsm subscriber `extension` IS the
+// dial target itself (their own msisdn[0] via asterisk2g_trunk).
+interface AutoDialEntry {
+  extension: string;
+  subscriberImsi: string;
+  gsm: boolean;
+}
+
+// A real inbound DID, resolved against its target subscriber's gsmEnabled
+// flag at dialplan-generation time -- same auto-derived-path reasoning as
+// AutoDialEntry above, just keyed by the DID instead of the subscriber's
+// own MSISDN. subscriberMsisdn is only populated (and only needed) when
+// gsm is true.
+interface DidDialEntry {
+  did: string;
+  subscriberImsi: string;
+  gsm: boolean;
+  subscriberMsisdn?: string;
+}
+
+function extensionsPstnConf(imsDomain: string, extensions: PstnExtension[], autoDialEntries: AutoDialEntry[], echoTestNumber: string, crossRanPeerCodes: { extension: string; label?: string }[], externalTrunkEnabled: boolean, didEntries: DidDialEntry[]): string {
   const header = `; Generated by the NMS's PSTN Gateway module — do not edit by hand,
 ; regenerated on every extension add/remove.
 
@@ -387,20 +587,268 @@ exten => ${echoTestNumber},1,NoOp(PSTN Gateway Echo Test)
     return `exten => ${e.extension},${body}\nexten => +${e.extension},${body}`;
   }).join('\n');
 
+  // Every subscriber's own real MSISDN, auto-dialable internally -- this is
+  // what lets "dial a known subscriber's real number" count as internal
+  // (not sent out the external trunk) without an operator having to
+  // manually create a PstnExtension for every subscriber. gsm=true routes
+  // via asterisk2g_trunk using the subscriber's own MSISDN as both the
+  // dialed digits AND the Dial() target (Asterisk-2G's own existing _X.
+  // catch-all completes it from there, unchanged); gsm=false reuses the
+  // exact same scscf_trunk/IMSI mechanism PstnExtension entries already use.
+  const autoDialBlocks = autoDialEntries.map(e => {
+    const target = e.gsm ? `${e.extension}@asterisk2g_trunk` : `${e.subscriberImsi}@scscf_trunk`;
+    // Early Ringing() for GSM-routed targets only -- same real-radio-paging-
+    // takes-a-few-seconds reasoning as the DID block above, and the same
+    // asterisk2g_trunk hop, so this is exposed to the identical premature-
+    // CANCEL risk from an impatient external caller. See didBlocks' own
+    // comment above for the full packet-level story.
+    const ringing = e.gsm ? ' same => n,Ringing()\n' : '';
+    const body = `1,NoOp(PSTN Gateway: auto-dial subscriber ${e.subscriberImsi} by their own MSISDN${e.gsm ? ' via 2G' : ''})
+${ringing} same => n,Dial(PJSIP/${target},60)
+ same => n,Hangup()
+`;
+    return `exten => ${e.extension},${body}\nexten => +${e.extension},${body}`;
+  }).join('\n');
+
   // Cross-RAN Calling: forward, don't resolve — dial the SAME digit string
   // out to asterisk2g_trunk so the call re-enters Asterisk-2G's own dialplan
   // at the exact short code it already owns, where its own existing
   // per-mapping Dial() logic completes it unchanged. This side never needs
   // to know which subscriber a 2G short code actually resolves to.
   const crossRanEntries = crossRanPeerCodes.map(e => {
+    // Every entry here is GSM-routed by definition (see comment above) --
+    // same early-Ringing() treatment as didBlocks/autoDialBlocks, unconditional.
     const body = `1,NoOp(Cross-RAN -> 2G short code ${e.extension}${e.label ? ' (' + e.label + ')' : ''})
+ same => n,Ringing()
  same => n,Dial(PJSIP/${e.extension}@asterisk2g_trunk,60)
  same => n,Hangup()
 `;
     return `exten => ${e.extension},${body}`;
   }).join('\n');
 
-  return header + entries + '\n' + crossRanEntries;
+  // Outbound: "if it's not (1) an existing internal exact-match above or
+  // (2) the echo test, it's external" -- falls out structurally from
+  // Asterisk always preferring an exact literal over a _-pattern in the
+  // same context regardless of declaration order (already relied on
+  // elsewhere in this codebase, e.g. Asterisk-2G's own _X. catch-all vs its
+  // exact-match short codes), so this catch-all can never steal an
+  // already-working internal route. Caller ID is looked up by whatever
+  // identity scscf_trunk's trust_id_inbound=yes actually puts in
+  // ${CALLERID(num)} for a real subscriber-originated call -- confirmed
+  // live via real CDR data to be the subscriber's MSISDN, not their IMSI as
+  // this module originally assumed (see syncOutboundCallerIdLookupTable()'s
+  // and syncSubscriberMsisdnLookupTable()'s own comments for the full
+  // story); both AstDB tables are now keyed under both identities so the
+  // lookup works regardless. Real-world requirement found live (2026-09-19):
+  // the external provider only routes a call whose caller ID matches a DID
+  // it recognizes, so a subscriber's own assigned outbound caller ID (when
+  // they have one, via the independent OutboundCallerId collection --
+  // deliberately NOT their inbound DidMapping, since operators need to set
+  // these independently) takes priority over their raw MSISDN
+  // (syncSubscriberMsisdnLookupTable()). A subscriber with nothing assigned
+  // here still falls back to their MSISDN unchanged, so this is additive,
+  // not a behavior change for anyone without an outbound caller ID set.
+  // Only emitted when the external trunk is actually enabled -- with no
+  // external_trunk PJSIP peer to Dial() toward, an unmatched number instead
+  // falls through to Asterisk's own default "no matching extension"
+  // behavior, same as every deployment before this phase existed.
+  const outboundCatchAll = externalTrunkEnabled ? `
+exten => _X.,1,NoOp(PSTN Gateway: unmatched digits \${EXTEN} - checking external routing)
+ same => n,Set(CALLER_IMSI=\${CALLERID(num)})
+ same => n,Set(OUT_CALLERID=\${DB(pstn_subscriber_outbound_callerid/\${CALLER_IMSI})})
+ same => n,GotoIf($["\${OUT_CALLERID}" != ""]?dial)
+ same => n,Set(OUT_CALLERID=\${DB(pstn_subscriber_msisdn/\${CALLER_IMSI})})
+ same => n,GotoIf($["\${OUT_CALLERID}" = ""]?no_caller_id)
+ same => n(dial),Set(CALLERID(num)=\${OUT_CALLERID})
+ same => n,Set(CDR(accountcode)=external-did)
+ same => n,Dial(PJSIP/\${EXTEN}@external_trunk,60)
+ same => n,Hangup()
+ same => n(no_caller_id),NoOp(Caller \${CALLER_IMSI} has no outbound caller ID or MSISDN on file - rejecting outbound external call)
+ same => n,Busy()
+ same => n,Hangup()
+` : '';
+
+  // Real inbound DIDs get their OWN context, not [pstn-internal] -- a
+  // deliberate namespace split, not just tidiness: it structurally
+  // eliminates any DID-vs-short-code collision question (Asterisk never
+  // cross-matches between two different contexts), rather than needing a
+  // new collision guard the way Cross-RAN Calling needed one for sharing a
+  // single namespace across two instances. external_trunk's own AOR
+  // (pjsipPstnConf()) points context= at this exact name. Asterisk allows
+  // multiple [context] sections in one file, so this stays in
+  // extensions_pstn.conf rather than needing a second generated file/
+  // manifest entry. Bare + "+"-prefixed variants, same defensive shape as
+  // every other digit-string entry above -- the real provider's exact
+  // format isn't known until Phase 5's live test.
+  const didHeader = `
+[pstn-external-inbound]
+`;
+  const didBlocks = didEntries.map(e => {
+    const target = e.gsm ? `${e.subscriberMsisdn}@asterisk2g_trunk` : `${e.subscriberImsi}@scscf_trunk`;
+    // GSM-routed DIDs only: real-radio paging (PSTN -> asterisk2g_trunk ->
+    // sipconn -> MNCC -> osmo-msc -> actual over-the-air paging) genuinely
+    // takes a few real seconds -- confirmed live 2026-09-20 via packet
+    // capture that with nothing sent back in that window, a real external
+    // caller's own PBX (IncrediblePBX, in this case) hits its own
+    // no-provisional-response timeout (~3s) and CANCELs before the phone
+    // ever gets a chance to ring; every hop in this NMS's own chain was
+    // just faithfully relaying that upstream cancel, not causing it.
+    // Ringing() sends a real SIP 180 immediately, before Dial() even starts,
+    // which resets that timer on the caller's end. Not applied to the
+    // scscf_trunk (4G/IMS) branch -- that path calls Dial() fast enough on
+    // its own and has shown no sign of this problem.
+    const ringing = e.gsm ? ' same => n,Ringing()\n' : '';
+    const body = `1,NoOp(Inbound DID -> subscriber ${e.subscriberImsi}${e.gsm ? ' via 2G' : ''})
+${ringing} same => n,Dial(PJSIP/${target},60)
+ same => n,Hangup()
+`;
+    return `exten => ${e.did},${body}\nexten => +${e.did},${body}`;
+  }).join('\n');
+
+  return header + entries + '\n' + autoDialBlocks + '\n' + crossRanEntries + '\n' + outboundCatchAll + didHeader + didBlocks;
+}
+
+// Bulk-fetch + filter/map, matching asterisk-2g-controller.ts's own
+// resolveGsm2gShortCodes() shape exactly. usedDigits carries every digit
+// string already spoken for (PstnExtension entries, the echo-test number,
+// cross-RAN peer codes) so a real subscriber MSISDN that happens to
+// collide with one of those never gets a duplicate/conflicting exten =>
+// line -- the existing, explicitly-assigned mapping always wins.
+async function resolveAutoDialEntries(
+  subscriberRepo: ISubscriberRepository,
+  usedDigits: Set<string>,
+  crossRanEnabled: boolean,
+): Promise<AutoDialEntry[]> {
+  const subs = await subscriberRepo.findAllFull();
+  return subs
+    .filter(s => s.msisdn?.[0] && !usedDigits.has(s.msisdn[0]))
+    // A gsmEnabled subscriber is only reachable via asterisk2g_trunk, which
+    // only exists as a PJSIP peer at all when Cross-RAN Calling is on (see
+    // pjsipPstnConf()'s crossRanBlock) -- skip rather than emit a Dial()
+    // toward a peer that doesn't exist, which would just fail every call.
+    .filter(s => !s.gsmEnabled || crossRanEnabled)
+    .map(s => ({ extension: s.msisdn![0], subscriberImsi: s.imsi, gsm: !!s.gsmEnabled }));
+}
+
+// Same bulk-fetch shape as resolveAutoDialEntries() above, for DidMapping
+// instead of a subscriber's own MSISDN. A gsm-routed mapping is skipped
+// (not emitted with a broken Dial() target) if the target subscriber has
+// no MSISDN on file, or if Cross-RAN Calling is off (same asterisk2g_trunk-
+// doesn't-exist-yet reasoning as resolveAutoDialEntries()).
+async function resolveDidMappingEntries(
+  mongoUri: string,
+  subscriberRepo: ISubscriberRepository,
+  crossRanEnabled: boolean,
+): Promise<DidDialEntry[]> {
+  const mappings = await withDidMappings(mongoUri, col => col.find({}).toArray());
+  if (mappings.length === 0) return [];
+  const subsByImsi = new Map((await subscriberRepo.findAllFull()).map(s => [s.imsi, s]));
+  const entries: DidDialEntry[] = [];
+  for (const m of mappings) {
+    const sub = subsByImsi.get(m.subscriberImsi);
+    const gsm = !!sub?.gsmEnabled;
+    if (gsm && (!crossRanEnabled || !sub?.msisdn?.[0])) continue;
+    entries.push({ did: m.did, subscriberImsi: m.subscriberImsi, gsm, subscriberMsisdn: sub?.msisdn?.[0] });
+  }
+  return entries;
+}
+
+// AstDB (Asterisk's own bundled SQLite key/value store, `database put/get`)
+// -- the caller-ID lookup the outbound catch-all's ${DB(...)} reads from.
+// Kept in sync with the FULL subscriber list (every subscriber with an
+// MSISDN, not just ones with an inbound DID mapped -- outbound eligibility
+// is "has an MSISDN on file", period). Real bug found live (2026-09-19):
+// this was keyed by IMSI only, on the assumption that scscf_trunk's
+// trust_id_inbound=yes puts the subscriber's IMSI in ${CALLERID(num)} --
+// real CDR data (Master.csv "src" field) proves it's actually their
+// MSISDN. That made this lookup a silent no-op for every subscriber (their
+// own MSISDN was never found under an IMSI key, so ${CALLERID(num)} just
+// passed through unchanged -- which happened to look identical to success
+// since it was already their real MSISDN, until the DID table's own
+// version of this exact bug made the failure visible as a real Busy()).
+// Now keyed under both identities so the lookup succeeds regardless of
+// which one ${CALLERID(num)} turns out to be. Idempotent, cheap, matches
+// this file's own "reload is cheap, this list stays small" reasoning
+// elsewhere -- runs on every regenerateDialplan() call, not just when a
+// subscriber's MSISDN actually changes.
+async function syncSubscriberMsisdnLookupTable(subscriberRepo: ISubscriberRepository): Promise<void> {
+  const subs = await subscriberRepo.findAllFull();
+  const desired = new Map<string, string>();
+  for (const s of subs) {
+    const msisdn = s.msisdn?.[0];
+    if (!msisdn) continue;
+    desired.set(s.imsi, msisdn);
+    desired.set(msisdn, msisdn);
+  }
+
+  const existingKeys = new Set<string>();
+  try {
+    const { stdout } = await nsenter('asterisk', ['-rx', 'database show pstn_subscriber_msisdn']);
+    // Real "database show <family>" output format: "/pstn_subscriber_msisdn/<imsi>  : <msisdn>"
+    for (const line of stdout.split('\n')) {
+      const m = /^\/pstn_subscriber_msisdn\/(\S+)\s*:/.exec(line.trim());
+      if (m) existingKeys.add(m[1]);
+    }
+  } catch { /* family doesn't exist yet on a fresh install -- nothing to read */ }
+
+  for (const [imsi, msisdn] of desired) {
+    await nsenter('asterisk', ['-rx', `database put pstn_subscriber_msisdn ${imsi} ${msisdn}`]).catch(() => {});
+  }
+  for (const key of existingKeys) {
+    if (!desired.has(key)) await nsenter('asterisk', ['-rx', `database del pstn_subscriber_msisdn ${key}`]).catch(() => {});
+  }
+}
+
+// Real-world requirement found live (2026-09-19): the external provider
+// only routes an outbound call if the caller ID it sees matches a DID it
+// already knows about — presenting the subscriber's raw MSISDN (never
+// registered with the provider at all) gets the call rejected/misrouted on
+// their end even though it looks perfectly normal on ours. Sourced from the
+// dedicated OutboundCallerId collection (NOT did_mappings — the two started
+// out sharing one table on the assumption a subscriber only needs one
+// identity in both directions, reverted the same day once real operator
+// need showed otherwise; see OutboundCallerId's own comment). Same AstDB
+// idempotent put/del shape as syncSubscriberMsisdnLookupTable() above,
+// separate family (pstn_subscriber_outbound_callerid) so a subscriber with
+// no entry here simply has no key and the dialplan's own fallback to
+// pstn_subscriber_msisdn still applies unchanged. Real bug found live
+// (2026-09-19) building the original version of this table: real CDR data
+// (Master.csv "src" field) proves scscf_trunk's trust_id_inbound=yes
+// actually puts the calling subscriber's MSISDN into ${CALLERID(num)}, not
+// their IMSI as this module originally assumed everywhere (including the
+// pre-existing pstn_subscriber_msisdn table, which happened to never matter
+// in practice since a subscriber's own MSISDN is already correct as-is —
+// the DB substitution was a silent no-op for them, not a real failure, so
+// this went unnoticed until this table's own wrong substitution made it
+// visible as an actual Busy()). Fixed by keying every entry under both
+// identities (IMSI and, when the subscriber has one, MSISDN too) so the
+// lookup succeeds regardless of which one ${CALLERID(num)} actually turns
+// out to be for a given call, rather than re-guessing a single "correct" key.
+async function syncOutboundCallerIdLookupTable(mongoUri: string, subscriberRepo: ISubscriberRepository): Promise<void> {
+  const entries = await withOutboundCallerIds(mongoUri, col => col.find({}).toArray());
+  const subsByImsi = new Map((await subscriberRepo.findAllFull()).map(s => [s.imsi, s]));
+  const desired = new Map<string, string>();
+  for (const e of entries) {
+    desired.set(e.subscriberImsi, e.callerId);
+    const msisdn = subsByImsi.get(e.subscriberImsi)?.msisdn?.[0];
+    if (msisdn) desired.set(msisdn, e.callerId);
+  }
+
+  const existingKeys = new Set<string>();
+  try {
+    const { stdout } = await nsenter('asterisk', ['-rx', 'database show pstn_subscriber_outbound_callerid']);
+    for (const line of stdout.split('\n')) {
+      const m = /^\/pstn_subscriber_outbound_callerid\/(\S+)\s*:/.exec(line.trim());
+      if (m) existingKeys.add(m[1]);
+    }
+  } catch { /* family doesn't exist yet on a fresh install -- nothing to read */ }
+
+  for (const [imsi, callerId] of desired) {
+    await nsenter('asterisk', ['-rx', `database put pstn_subscriber_outbound_callerid ${imsi} ${callerId}`]).catch(() => {});
+  }
+  for (const key of existingKeys) {
+    if (!desired.has(key)) await nsenter('asterisk', ['-rx', `database del pstn_subscriber_outbound_callerid ${key}`]).catch(() => {});
+  }
 }
 
 // Direct Mongo read, no join needed — cross-RAN forwarding only needs the
@@ -424,6 +872,19 @@ export function getPstnBindAddress(): { ip: string; port: number } | null {
   return state ? { ip: state.asteriskIp, port: ASTERISK_PORT } : null;
 }
 
+// Exported so ims-controller.ts's configureIms() can preserve PSTN's own
+// dispatcher.list entry across a plain IMS Configure re-run instead of
+// blindly overwriting it back to the shared static template's placeholder
+// content — dispatcher.list is a file BOTH modules write to (this one owns
+// the real entry once PSTN is configured; ims-controller.ts owns deploying
+// the placeholder on a fresh install where PSTN was never set up). Mirrors
+// writeDispatcherEntry()'s own exact format — kept as a single source of
+// truth so the two writers can never silently drift apart on syntax.
+export function formatPstnDispatcherEntry(): string | null {
+  const bind = getPstnBindAddress();
+  return bind ? `1 sip:${bind.ip}:${bind.port}\n` : null;
+}
+
 // Static import (the pre-existing safe direction) — no lazy import needed on
 // this side, unlike asterisk-2g-controller.ts's own copy of this helper.
 async function getCrossRanPeerCodes(mongoUri: string): Promise<{ extension: string; label?: string }[]> {
@@ -439,14 +900,23 @@ async function isCodecGsmLoadedPstn(): Promise<boolean> {
   } catch { return false; }
 }
 
-async function regenerateDialplan(mongoUri: string, echoTestNumber?: string): Promise<void> {
+async function regenerateDialplan(mongoUri: string, subscriberRepo: ISubscriberRepository, echoTestNumber?: string): Promise<void> {
   const imsState = readImsState();
   if (!imsState) throw new Error('IMS is not configured yet — configure IMS before assigning PSTN extensions.');
   const extensions = await withExtensions(mongoUri, col => col.find({}).toArray());
   const resolvedEchoTestNumber = echoTestNumber || readPstnState()?.echoTestNumber || DEFAULT_ECHO_TEST_NUMBER;
   const crossRanPeerCodes = await getCrossRanPeerCodes(mongoUri);
+  const crossRanEnabled = !!readPstnState()?.crossRanEnabled;
+  const usedDigits = new Set<string>([resolvedEchoTestNumber, ...extensions.map(e => e.extension), ...crossRanPeerCodes.map(c => c.extension)]);
+  const autoDialEntries = await resolveAutoDialEntries(subscriberRepo, usedDigits, crossRanEnabled);
+  const externalTrunkEnabled = !!readPstnState()?.externalTrunk?.enabled;
+  const didEntries = await resolveDidMappingEntries(mongoUri, subscriberRepo, crossRanEnabled);
   fs.mkdirSync(HOST_ASTERISK_DIR, { recursive: true });
-  fs.writeFileSync(HOST_EXTENSIONS_INC, extensionsPstnConf(imsState.imsDomain, extensions, resolvedEchoTestNumber, crossRanPeerCodes), 'utf-8');
+  fs.writeFileSync(HOST_EXTENSIONS_INC, extensionsPstnConf(imsState.imsDomain, extensions, autoDialEntries, resolvedEchoTestNumber, crossRanPeerCodes, externalTrunkEnabled, didEntries), 'utf-8');
+  if (externalTrunkEnabled) {
+    await syncSubscriberMsisdnLookupTable(subscriberRepo);
+    await syncOutboundCallerIdLookupTable(mongoUri, subscriberRepo);
+  }
   await nsenter('asterisk', ['-rx', 'dialplan reload']).catch(() => {});
 }
 
@@ -636,6 +1106,8 @@ export async function installPstn(write: (s: string) => void): Promise<{ success
 export async function configurePstn(
   input: { asteriskIp: string; echoTestNumber?: string },
   mongoUri: string,
+  subscriberRepo: ISubscriberRepository,
+  hostExecutor: IHostExecutor,
 ): Promise<{ success: boolean; error?: string; message?: string; asteriskIp?: string }> {
   const asteriskIp = input.asteriskIp || DEFAULT_ASTERISK_IP;
   try {
@@ -662,9 +1134,17 @@ export async function configurePstn(
       // asterisk2g_trunk peer even though crossRanEnabled itself is
       // untouched by this function. See CLAUDE.md's Cross-RAN Calling entry.
       const crossRanPeer = existing?.crossRanEnabled ? getAsterisk2gBindAddress() : null;
-      fs.writeFileSync(HOST_PJSIP_INC, pjsipPstnConf(asteriskIp, imsState.config.icscfIp, imsState.config.icscfPort, imsState.config.scscfIp, imsState.config.pcscfIp, crossRanPeer), 'utf-8');
+      // Same reasoning as crossRanPeer above, for the external trunk —
+      // preserve it across a routine re-Configure rather than silently
+      // dropping it (this write is wholesale, not a merge).
+      const externalTrunk = existing?.externalTrunk ?? null;
+      fs.writeFileSync(HOST_PJSIP_INC, pjsipPstnConf(asteriskIp, {
+        icscfIp: imsState.config.icscfIp, icscfPort: imsState.config.icscfPort,
+        scscfIp: imsState.config.scscfIp, mediaIp: imsState.config.pcscfIp,
+      }, { crossRan: crossRanPeer, external: externalTrunk }), 'utf-8');
+      if (externalTrunk?.enabled) await applyExternalTrunkFirewall(hostExecutor, { bindIp: externalTrunk.bindIp, bindPort: externalTrunk.bindPort, providerCidr: externalTrunk.providerCidr });
       await ensureStrictRtpDisabled();
-      await regenerateDialplan(mongoUri, echoTestNumber);
+      await regenerateDialplan(mongoUri, subscriberRepo, echoTestNumber);
 
       await nsenter('systemctl', ['enable', '--now', 'asterisk']);
       await nsenter('asterisk', ['-rx', 'module reload res_pjsip.so']).catch(() => {});
@@ -765,8 +1245,11 @@ export async function setCrossRanCalling(
     // value immediately.
     writePstnState({ ...existing, crossRanEnabled: enabled });
 
-    fs.writeFileSync(HOST_PJSIP_INC, pjsipPstnConf(existing.asteriskIp, imsState.config.icscfIp, imsState.config.icscfPort, imsState.config.scscfIp, imsState.config.pcscfIp, asterisk2gPeer), 'utf-8');
-    await regenerateDialplan(mongoUri, existing.echoTestNumber);
+    fs.writeFileSync(HOST_PJSIP_INC, pjsipPstnConf(existing.asteriskIp, {
+      icscfIp: imsState.config.icscfIp, icscfPort: imsState.config.icscfPort,
+      scscfIp: imsState.config.scscfIp, mediaIp: imsState.config.pcscfIp,
+    }, { crossRan: asterisk2gPeer, external: existing.externalTrunk ?? null }), 'utf-8');
+    await regenerateDialplan(mongoUri, subscriberRepo, existing.echoTestNumber);
     await nsenter('asterisk', ['-rx', 'module reload res_pjsip.so']).catch(() => {});
 
     const peerResult = await setCrossRanPeer(enabled, mongoUri, subscriberRepo);
@@ -781,6 +1264,71 @@ export async function setCrossRanCalling(
     return { success: true };
   } catch (err) {
     return { success: false, error: String(err) };
+  }
+}
+
+// ── External SIP trunk (real DID connectivity) ──────────────────────────────
+//
+// Shared apply step for /external-trunk/enable and /external-trunk/disable —
+// regenerates pjsip_pstn.conf from CURRENT saved state (so it always reflects
+// whatever crossRanEnabled/externalTrunk.enabled already are, same "preserve
+// the other peer's wiring on a wholesale rewrite" reasoning as configurePstn()
+// and setCrossRanCalling() above), reloads res_pjsip live (never a full
+// restart — matches every other PSTN toggle in this file), applies or
+// removes the nftables allowlist to match, AND regenerates the dialplan —
+// extensionsPstnConf()'s outbound catch-all and [pstn-external-inbound]
+// context both depend on whether external_trunk actually exists as a PJSIP
+// peer, so a bare pjsip-config-only reload here would leave the dialplan
+// out of sync with reality (e.g. a catch-all still trying to Dial() toward
+// a peer that was just disabled). Callers mutate+save PstnState BEFORE
+// calling this, so it always regenerates from the already-updated state,
+// not a stale in-memory copy.
+export async function applyExternalTrunkChange(mongoUri: string, subscriberRepo: ISubscriberRepository, hostExecutor: IHostExecutor): Promise<void> {
+  const state = readPstnState();
+  if (!state) throw new Error('PSTN Gateway is not configured yet — configure it first.');
+  const imsState = readImsState();
+  if (!imsState) throw new Error('IMS is not configured — cannot regenerate the dialplan.');
+  const crossRanPeer = state.crossRanEnabled ? getAsterisk2gBindAddress() : null;
+  fs.writeFileSync(HOST_PJSIP_INC, pjsipPstnConf(state.asteriskIp, {
+    icscfIp: imsState.config.icscfIp, icscfPort: imsState.config.icscfPort,
+    scscfIp: imsState.config.scscfIp, mediaIp: imsState.config.pcscfIp,
+  }, { crossRan: crossRanPeer, external: state.externalTrunk ?? null }), 'utf-8');
+  await regenerateDialplan(mongoUri, subscriberRepo, state.echoTestNumber);
+  // A plain `module reload res_pjsip.so` does NOT rebind an existing
+  // type=transport object's socket to a new bind address — confirmed live
+  // 2026-09-19: after changing externalTrunk.bindIp and reloading, `pjsip
+  // show transport transport-external` kept reporting the OLD bind address
+  // (asterisk had a stale in-memory transport bound to the previous IP)
+  // even though the freshly-regenerated pjsip_pstn.conf on disk already had
+  // the new one — only a full restart actually recreates the socket. Every
+  // call into this function is inherently an external-trunk transport
+  // change (enable/disable/reconfigure-while-enabled), so always restart
+  // here rather than trying to distinguish "did the bind address actually
+  // change" — same native_rtp re-suspend the manual /restart route already
+  // needs, since that bridge-technology setting doesn't persist restarts.
+  await nsenter('systemctl', ['restart', 'asterisk']);
+  await ensureNativeRtpBridgeSuspended();
+  // Real bug found live (2026-09-19): restarting Asterisk takes scscf_trunk
+  // down for a moment, and if S-CSCF's dispatcher module (which actively
+  // pings every PSTN Gateway destination every 15s, ds_probing_mode=1) polls
+  // during exactly that window, it marks the destination inactive — and
+  // despite probing being enabled, it did NOT auto-recover on its own even
+  // several minutes after Asterisk was back up and fully healthy (confirmed
+  // live: `dispatcher.list` still showed the destination as down while every
+  // other health check — pjsip endpoint state, service status — was green).
+  // Every real call through this trunk failed with "No PSTN-Gateways
+  // available" until a manual `dispatcher.reload` cleared it. Since this
+  // function restarts Asterisk on every external-trunk enable/disable/
+  // reconfigure, always force a fresh dispatcher reload right after —
+  // reloadDispatcher() re-reads dispatcher.list from disk without touching
+  // the rest of the running kamailio-scscf process (see its own comment,
+  // above) so this is safe to call unconditionally, not just when something
+  // about the dispatcher target itself actually changed.
+  await reloadDispatcher();
+  if (state.externalTrunk?.enabled) {
+    await applyExternalTrunkFirewall(hostExecutor, { bindIp: state.externalTrunk.bindIp, bindPort: state.externalTrunk.bindPort, providerCidr: state.externalTrunk.providerCidr });
+  } else {
+    await removeExternalTrunkFirewall(hostExecutor);
   }
 }
 
@@ -815,6 +1363,7 @@ export function createPstnRouter(
   mongoUri: string,
   logger: pino.Logger,
   auditLogger: IAuditLogger,
+  hostExecutor: IHostExecutor,
 ): Router {
   const router = Router();
 
@@ -851,6 +1400,13 @@ export function createPstnRouter(
 
       const extensions = await withExtensions(mongoUri, col => col.find({}).toArray()).catch(() => []);
 
+      // Surfaces why some gsmEnabled subscribers aren't reachable via their
+      // own real MSISDN yet (see resolveAutoDialEntries()'s own comment) —
+      // cheap, matches extensionCount's own bulk-fetch-and-count shape.
+      const gsmEnabledWithoutCrossRanCount = state?.crossRanEnabled
+        ? 0
+        : (await subscriberRepo.findAllFull().catch(() => [])).filter(s => s.gsmEnabled).length;
+
       // See ims-controller.ts's identical check — no recorded version at
       // all (pre-dates this field) counts as stale too, since we don't
       // know what template that deployment is actually running.
@@ -864,6 +1420,7 @@ export function createPstnRouter(
         codecAmrLoaded,
         codecGsmLoaded,
         crossRanEnabled: !!state?.crossRanEnabled,
+        externalTrunkEnabled: !!state?.externalTrunk?.enabled,
         imsInstalled: await isImsInstalled(),
         imsConfigured: !!imsState,
         hasSavedConfig: !!state,
@@ -873,6 +1430,7 @@ export function createPstnRouter(
           ? { ...state, echoTestNumber: state.echoTestNumber ?? DEFAULT_ECHO_TEST_NUMBER }
           : { asteriskIp: DEFAULT_ASTERISK_IP, echoTestNumber: DEFAULT_ECHO_TEST_NUMBER },
         extensionCount: extensions.length,
+        gsmEnabledWithoutCrossRanCount,
         appVersion,
         configuredWithVersion: state?.configuredWithVersion,
         configStale,
@@ -907,7 +1465,7 @@ export function createPstnRouter(
     const user = (req as any).user?.username ?? 'unknown';
     const asteriskIp = (req.body.asteriskIp as string) || DEFAULT_ASTERISK_IP;
     const echoTestNumber = req.body.echoTestNumber as string | undefined;
-    const result = await configurePstn({ asteriskIp, echoTestNumber }, mongoUri);
+    const result = await configurePstn({ asteriskIp, echoTestNumber }, mongoUri, subscriberRepo, hostExecutor);
     if (!result.success) {
       await auditLogger.log({ action: 'pstn_configure', user, details: result.error ?? 'failed', success: false });
       return res.status(400).json({ success: false, error: result.error });
@@ -973,7 +1531,7 @@ export function createPstnRouter(
         if (existing) throw new Error(`Extension ${extension} is already assigned`);
         await col.insertOne({ extension, subscriberImsi, label, createdAt: new Date().toISOString() });
       });
-      await regenerateDialplan(mongoUri);
+      await regenerateDialplan(mongoUri, subscriberRepo);
 
       await auditLogger.log({ action: 'pstn_extension_add', user, details: `${extension} -> ${subscriberImsi}`, success: true });
       res.json({ success: true });
@@ -989,11 +1547,333 @@ export function createPstnRouter(
     const extension = decodeURIComponent(req.params.extension);
     try {
       await withExtensions(mongoUri, col => col.deleteOne({ extension }));
-      await regenerateDialplan(mongoUri);
+      await regenerateDialplan(mongoUri, subscriberRepo);
       await auditLogger.log({ action: 'pstn_extension_remove', user, details: extension, success: true });
       res.json({ success: true });
     } catch (err) {
       await auditLogger.log({ action: 'pstn_extension_remove', user, details: String(err), success: false });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // GET /api/pstn/did-mappings — list, joined with subscriber nickname/MSISDN/
+  // gsmEnabled (mirrors GET /extensions exactly). Real DID→subscriber
+  // inbound routing — see DidMapping's own comment for why this is a
+  // separate collection/dialplan namespace, not a PstnExtension variant.
+  router.get('/did-mappings', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const mappings = await withDidMappings(mongoUri, col => col.find({}).sort({ did: 1 }).toArray());
+      const nicknames = await subscriberRepo.getNicknamesByImsi(mappings.map(m => m.subscriberImsi));
+      const allSubs = await subscriberRepo.findAllFull();
+      const msisdnByImsi = new Map(allSubs.map(s => [s.imsi, s.msisdn?.[0]]));
+      const gsmEnabledByImsi = new Map(allSubs.map(s => [s.imsi, !!s.gsmEnabled]));
+      res.json({
+        success: true,
+        didMappings: mappings.map(m => ({
+          ...m,
+          subscriberNickname: nicknames[m.subscriberImsi],
+          subscriberMsisdn: msisdnByImsi.get(m.subscriberImsi),
+          subscriberGsmEnabled: gsmEnabledByImsi.get(m.subscriberImsi) ?? false,
+        })),
+      });
+    } catch (err) {
+      logger.error({ err: String(err) }, 'pstn did-mappings list error');
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // POST /api/pstn/did-mappings — body: { did, subscriberImsi, label? }
+  router.post('/did-mappings', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const { subscriberImsi, label } = req.body as { did?: string; subscriberImsi?: string; label?: string };
+    const rawDid = req.body.did as string | undefined;
+    if (!rawDid || !EXTENSION_INPUT_RE.test(rawDid)) {
+      return res.status(400).json({ success: false, error: 'did must be 1-15 digits (a leading "+" is accepted but not required)' });
+    }
+    const did = normalizeExtension(rawDid);
+    if (!subscriberImsi || !/^\d{6,15}$/.test(subscriberImsi)) {
+      return res.status(400).json({ success: false, error: 'subscriberImsi is required' });
+    }
+    try {
+      const subscriber = await subscriberRepo.findByImsi(subscriberImsi);
+      if (!subscriber) return res.status(404).json({ success: false, error: `No subscriber with IMSI ${subscriberImsi}` });
+
+      await withDidMappings(mongoUri, async col => {
+        const existing = await col.findOne({ did });
+        if (existing) throw new Error(`DID ${did} is already assigned`);
+        await col.insertOne({ did, subscriberImsi, label, createdAt: new Date().toISOString() });
+      });
+      await regenerateDialplan(mongoUri, subscriberRepo);
+
+      await auditLogger.log({ action: 'pstn_did_mapping_add', user, details: `${did} -> ${subscriberImsi}`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_did_mapping_add', user, details: String(err), success: false });
+      res.status(400).json({ success: false, error: String((err as Error).message ?? err) });
+    }
+  });
+
+  // PUT /api/pstn/did-mappings/:did — body: { did?, subscriberImsi, label? }.
+  // Edits an existing row in place (:did in the URL identifies the CURRENT
+  // row; body.did, if different, becomes its new value) — the UI's inline
+  // editor uses this instead of delete+re-add, which would otherwise lose
+  // the row's position/history for a simple value change.
+  router.put('/did-mappings/:did', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const currentDid = decodeURIComponent(req.params.did);
+    const rawDid = (req.body.did as string | undefined) ?? currentDid;
+    if (!EXTENSION_INPUT_RE.test(rawDid)) {
+      return res.status(400).json({ success: false, error: 'did must be 1-15 digits (a leading "+" is accepted but not required)' });
+    }
+    const newDid = normalizeExtension(rawDid);
+    const { subscriberImsi, label } = req.body as { subscriberImsi?: string; label?: string };
+    if (!subscriberImsi || !/^\d{6,15}$/.test(subscriberImsi)) {
+      return res.status(400).json({ success: false, error: 'subscriberImsi is required' });
+    }
+    try {
+      const subscriber = await subscriberRepo.findByImsi(subscriberImsi);
+      if (!subscriber) return res.status(404).json({ success: false, error: `No subscriber with IMSI ${subscriberImsi}` });
+
+      await withDidMappings(mongoUri, async col => {
+        const existingRow = await col.findOne({ did: currentDid });
+        if (!existingRow) throw new Error(`No DID mapping found for ${currentDid}`);
+        if (newDid !== currentDid) {
+          const collision = await col.findOne({ did: newDid });
+          if (collision) throw new Error(`DID ${newDid} is already assigned`);
+        }
+        await col.updateOne({ did: currentDid }, { $set: { did: newDid, subscriberImsi, label } });
+      });
+      await regenerateDialplan(mongoUri, subscriberRepo);
+
+      await auditLogger.log({ action: 'pstn_did_mapping_edit', user, details: `${currentDid} -> ${newDid} (${subscriberImsi})`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_did_mapping_edit', user, details: String(err), success: false });
+      res.status(400).json({ success: false, error: String((err as Error).message ?? err) });
+    }
+  });
+
+  // DELETE /api/pstn/did-mappings/:did
+  router.delete('/did-mappings/:did', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const did = decodeURIComponent(req.params.did);
+    try {
+      await withDidMappings(mongoUri, col => col.deleteOne({ did }));
+      await regenerateDialplan(mongoUri, subscriberRepo);
+      await auditLogger.log({ action: 'pstn_did_mapping_remove', user, details: did, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_did_mapping_remove', user, details: String(err), success: false });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // GET /api/pstn/outbound-caller-ids — list, joined with subscriber
+  // nickname/MSISDN (same shape as GET /did-mappings). See OutboundCallerId's
+  // own comment for why this is a separate collection from did-mappings.
+  router.get('/outbound-caller-ids', requireAdmin, async (_req: Request, res: Response) => {
+    try {
+      const entries = await withOutboundCallerIds(mongoUri, col => col.find({}).sort({ subscriberImsi: 1 }).toArray());
+      const nicknames = await subscriberRepo.getNicknamesByImsi(entries.map(e => e.subscriberImsi));
+      const allSubs = await subscriberRepo.findAllFull();
+      const msisdnByImsi = new Map(allSubs.map(s => [s.imsi, s.msisdn?.[0]]));
+      res.json({
+        success: true,
+        outboundCallerIds: entries.map(e => ({
+          ...e,
+          subscriberNickname: nicknames[e.subscriberImsi],
+          subscriberMsisdn: msisdnByImsi.get(e.subscriberImsi),
+        })),
+      });
+    } catch (err) {
+      logger.error({ err: String(err) }, 'pstn outbound-caller-ids list error');
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // POST /api/pstn/outbound-caller-ids — body: { subscriberImsi, callerId, label? }.
+  // One active entry per subscriber (unlike did-mappings' many-per-subscriber) —
+  // re-posting for a subscriber that already has one replaces it, rather than
+  // erroring, since "change what this subscriber presents outbound" is the
+  // expected edit path (there's no meaningful "second outbound caller ID").
+  router.post('/outbound-caller-ids', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const { subscriberImsi, label } = req.body as { subscriberImsi?: string; label?: string };
+    const rawCallerId = req.body.callerId as string | undefined;
+    if (!rawCallerId || !EXTENSION_INPUT_RE.test(rawCallerId)) {
+      return res.status(400).json({ success: false, error: 'callerId must be 1-15 digits (a leading "+" is accepted but not required)' });
+    }
+    const callerId = normalizeExtension(rawCallerId);
+    if (!subscriberImsi || !/^\d{6,15}$/.test(subscriberImsi)) {
+      return res.status(400).json({ success: false, error: 'subscriberImsi is required' });
+    }
+    try {
+      const subscriber = await subscriberRepo.findByImsi(subscriberImsi);
+      if (!subscriber) return res.status(404).json({ success: false, error: `No subscriber with IMSI ${subscriberImsi}` });
+
+      await withOutboundCallerIds(mongoUri, async col => {
+        await col.replaceOne(
+          { subscriberImsi },
+          { subscriberImsi, callerId, label, createdAt: new Date().toISOString() },
+          { upsert: true },
+        );
+      });
+      await regenerateDialplan(mongoUri, subscriberRepo);
+
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_set', user, details: `${subscriberImsi} -> ${callerId}`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_set', user, details: String(err), success: false });
+      res.status(400).json({ success: false, error: String((err as Error).message ?? err) });
+    }
+  });
+
+  // PUT /api/pstn/outbound-caller-ids/:imsi — body: { subscriberImsi?, callerId,
+  // label? }. Edits an existing entry in place (:imsi in the URL identifies
+  // the CURRENT row; body.subscriberImsi, if different, moves it to a new
+  // subscriber) — same "inline edit, not delete+re-add" rationale as the
+  // did-mappings PUT above. Rejects moving onto a subscriber that already
+  // has their own entry (1:1 by design — see OutboundCallerId's own
+  // comment) rather than silently clobbering it.
+  router.put('/outbound-caller-ids/:imsi', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const currentImsi = decodeURIComponent(req.params.imsi);
+    const rawCallerId = req.body.callerId as string | undefined;
+    if (!rawCallerId || !EXTENSION_INPUT_RE.test(rawCallerId)) {
+      return res.status(400).json({ success: false, error: 'callerId must be 1-15 digits (a leading "+" is accepted but not required)' });
+    }
+    const callerId = normalizeExtension(rawCallerId);
+    const { label } = req.body as { label?: string };
+    const newImsi = (req.body.subscriberImsi as string | undefined) ?? currentImsi;
+    if (!/^\d{6,15}$/.test(newImsi)) {
+      return res.status(400).json({ success: false, error: 'subscriberImsi is required' });
+    }
+    try {
+      const subscriber = await subscriberRepo.findByImsi(newImsi);
+      if (!subscriber) return res.status(404).json({ success: false, error: `No subscriber with IMSI ${newImsi}` });
+
+      await withOutboundCallerIds(mongoUri, async col => {
+        const existingRow = await col.findOne({ subscriberImsi: currentImsi });
+        if (!existingRow) throw new Error(`No outbound caller ID found for ${currentImsi}`);
+        if (newImsi !== currentImsi) {
+          const collision = await col.findOne({ subscriberImsi: newImsi });
+          if (collision) throw new Error(`Subscriber ${newImsi} already has an outbound caller ID — remove it first or edit that row instead`);
+        }
+        await col.updateOne({ subscriberImsi: currentImsi }, { $set: { subscriberImsi: newImsi, callerId, label } });
+      });
+      await regenerateDialplan(mongoUri, subscriberRepo);
+
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_edit', user, details: `${currentImsi} -> ${newImsi} (${callerId})`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_edit', user, details: String(err), success: false });
+      res.status(400).json({ success: false, error: String((err as Error).message ?? err) });
+    }
+  });
+
+  // DELETE /api/pstn/outbound-caller-ids/:imsi
+  router.delete('/outbound-caller-ids/:imsi', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const subscriberImsi = decodeURIComponent(req.params.imsi);
+    try {
+      await withOutboundCallerIds(mongoUri, col => col.deleteOne({ subscriberImsi }));
+      await regenerateDialplan(mongoUri, subscriberRepo);
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_remove', user, details: subscriberImsi, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_outbound_caller_id_remove', user, details: String(err), success: false });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // POST /api/pstn/external-trunk/configure — body: { bindIp, bindPort?,
+  // interfaceMode? ('dummy'|'existing', defaults 'dummy'), externalMediaAddress?,
+  // providerHost, providerPort?, providerCidr? }. Creates/verifies the bindIp
+  // interface as a side effect (see DUMMY_IF_NAME_EXT's comment) before
+  // saving. Saves the field values only — does NOT flip `enabled` or touch the live
+  // config/firewall (see the separate /enable below). A real network-facing
+  // trunk deliberately gets a two-step "save the fields, then explicitly
+  // turn it on" flow rather than configurePstn()'s own single-step
+  // configure-and-apply, matching the higher blast radius of opening a real
+  // port to the outside world.
+  router.post('/external-trunk/configure', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const state = readPstnState();
+    if (!state) {
+      return res.status(400).json({ success: false, error: 'PSTN Gateway is not configured yet — configure it first.' });
+    }
+    const { bindIp, providerHost } = req.body as { bindIp?: string; providerHost?: string };
+    if (!bindIp) return res.status(400).json({ success: false, error: 'bindIp is required — a real, non-loopback interface IP the provider can reach.' });
+    if (!providerHost) return res.status(400).json({ success: false, error: 'providerHost is required.' });
+    const bindPort = Number(req.body.bindPort) || ASTERISK_PORT;
+    const providerPort = Number(req.body.providerPort) || ASTERISK_PORT;
+    const providerCidr = (req.body.providerCidr as string) || `${providerHost}/32`;
+    const interfaceMode: 'dummy' | 'existing' = req.body.interfaceMode === 'existing' ? 'existing' : 'dummy';
+    try {
+      // Same dummy-interface convention as SecGW's own gatewayIp — see
+      // DUMMY_IF_NAME_EXT's comment. This bindIp also needs to be reachable
+      // from off-host (the real provider), same EIGRP caveat as SecGW's —
+      // the frontend Setup tab shows the same manual frr.conf hint before
+      // Configure runs (this backend never touches frr.conf itself —
+      // CLAUDE.md gotcha #7).
+      if (interfaceMode === 'dummy') {
+        await createDummyInterface(DUMMY_IF_NAME_EXT, bindIp, 32, true);
+      } else {
+        const ipPresent = await nsenter('bash', ['-c', `ip -o addr show | awk '{print $4}' | cut -d/ -f1 | grep -qx '${bindIp}' && echo yes || echo no`])
+          .then(r => r.stdout.trim() === 'yes').catch(() => false);
+        if (!ipPresent) {
+          return res.status(400).json({
+            success: false,
+            error: `${bindIp} is not currently assigned to any interface on this host (checked with "ip addr show"). ` +
+              `In "use existing IP" mode you must bind it yourself first, then retry.`,
+          });
+        }
+      }
+      const externalTrunk: PstnExternalTrunkConfig = {
+        enabled: state.externalTrunk?.enabled ?? false,
+        bindIp, bindPort, interfaceMode,
+        externalMediaAddress: (req.body.externalMediaAddress as string) || undefined,
+        providerHost, providerPort, providerCidr,
+      };
+      writePstnState({ ...state, externalTrunk });
+      await auditLogger.log({ action: 'pstn_external_trunk_configure', user, details: `bindIp=${bindIp}:${bindPort} provider=${providerHost}:${providerPort} cidr=${providerCidr}`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_external_trunk_configure', user, details: String(err), success: false });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  router.post('/external-trunk/enable', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const state = readPstnState();
+    if (!state?.externalTrunk) {
+      return res.status(400).json({ success: false, error: 'Configure the external trunk (bind IP, provider host/CIDR) before enabling it.' });
+    }
+    try {
+      writePstnState({ ...state, externalTrunk: { ...state.externalTrunk, enabled: true } });
+      await applyExternalTrunkChange(mongoUri, subscriberRepo, hostExecutor);
+      await auditLogger.log({ action: 'pstn_external_trunk_enable', user, details: `bindIp=${state.externalTrunk.bindIp}:${state.externalTrunk.bindPort}`, success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_external_trunk_enable', user, details: String(err), success: false });
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  router.post('/external-trunk/disable', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const state = readPstnState();
+    if (!state?.externalTrunk) {
+      return res.status(400).json({ success: false, error: 'External trunk is not configured.' });
+    }
+    try {
+      writePstnState({ ...state, externalTrunk: { ...state.externalTrunk, enabled: false } });
+      await applyExternalTrunkChange(mongoUri, subscriberRepo, hostExecutor);
+      await auditLogger.log({ action: 'pstn_external_trunk_disable', user, details: '', success: true });
+      res.json({ success: true });
+    } catch (err) {
+      await auditLogger.log({ action: 'pstn_external_trunk_disable', user, details: String(err), success: false });
       res.status(500).json({ success: false, error: String(err) });
     }
   });
@@ -1003,6 +1883,13 @@ export function createPstnRouter(
     try {
       await nsenter('systemctl', ['start', 'asterisk']);
       await ensureNativeRtpBridgeSuspended();
+      // See applyExternalTrunkChange()'s comment on reloadDispatcher() —
+      // S-CSCF's dispatcher can catch this destination down mid-restart and
+      // not self-recover even with probing enabled; force a reload any time
+      // this route brings Asterisk back up. Best-effort: PSTN Gateway may
+      // not be configured at all yet (dispatcher.list wouldn't exist), so a
+      // failure here shouldn't fail the whole start.
+      await reloadDispatcher().catch(() => {});
       await auditLogger.log({ action: 'pstn_start', user, details: 'asterisk started', success: true });
       res.json({ success: true });
     } catch (err) {
@@ -1026,6 +1913,8 @@ export function createPstnRouter(
     try {
       await nsenter('systemctl', ['restart', 'asterisk']);
       await ensureNativeRtpBridgeSuspended();
+      // See applyExternalTrunkChange()'s comment on reloadDispatcher().
+      await reloadDispatcher().catch(() => {});
       await auditLogger.log({ action: 'pstn_restart', user, details: 'asterisk restarted', success: true });
       res.json({ success: true });
     } catch (err) {
@@ -1153,6 +2042,26 @@ export function createPstnRouter(
       write('\n=== Removing extension mappings ===');
       const removed = await withExtensions(mongoUri, col => col.deleteMany({})).then(r => r.deletedCount).catch(() => 0);
       write(`Removed ${removed} extension mapping(s).`);
+
+      write('\n=== Removing inbound DID mappings ===');
+      const removedDids = await withDidMappings(mongoUri, col => col.deleteMany({})).then(r => r.deletedCount).catch(() => 0);
+      write(`Removed ${removedDids} DID mapping(s).`);
+
+      write('\n=== Removing outbound caller ID assignments ===');
+      const removedCallerIds = await withOutboundCallerIds(mongoUri, col => col.deleteMany({})).then(r => r.deletedCount).catch(() => 0);
+      write(`Removed ${removedCallerIds} outbound caller ID assignment(s).`);
+
+      const externalTrunkAtUninstall = readPstnState()?.externalTrunk;
+      if (externalTrunkAtUninstall?.enabled) {
+        write('\n=== Removing external SIP trunk firewall allowlist ===');
+        await removeExternalTrunkFirewall(hostExecutor).catch(() => {});
+        write('Firewall rules removed.');
+      }
+      if (externalTrunkAtUninstall && externalTrunkAtUninstall.interfaceMode !== 'existing') {
+        write('\n=== Removing dummy-pstn-ext interface ===');
+        await deleteDummyInterface(DUMMY_IF_NAME_EXT).catch(() => {});
+        write('dummy-pstn-ext removed.');
+      }
 
       write('\n=== Removing generated config files ===');
       for (const f of [HOST_PJSIP_INC, HOST_EXTENSIONS_INC, HOST_PSTN_STATE]) {

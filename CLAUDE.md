@@ -298,7 +298,84 @@ services**, not containers. This is not a toy/demo app: it manages real CBRS rad
     `show bts 0`'s live `Features:` list against `codec-support`/
     `amr-config` before assuming it's hardware again.
 
-## Feature inventory (as of v2.0-beta_0.48, 2026-08-16)
+17. **SigScale OCS (Diameter Gy charging): `smf.conf` now has THREE
+    independently-owned `ConnectPeer` lines — Gx (Open5GS core, untouched by any
+    module), S6b (VoWiFi's `aaa.*` identity prefix), and Gy (this module's `ocs.*`
+    prefix) — each module's upsert function must regex-strip ONLY its own
+    prefix, never the whole file.** `upsertSmfGyPeer()`/`removeSmfGyPeer()`
+    (`ocs-controller.ts`) are a direct copy of VoWiFi's own `upsertSmfAaaPeer()`/
+    `removeSmfAaaPeer()` idiom (`vowifi-controller.ts:514-556`), scoped to
+    `/^[ \t]*ConnectPeer\s*=\s*"ocs\.[^"]*"[^\n]*\n?/gm` — this exclusive `ocs.`
+    naming slot is what keeps this module's writes from ever touching VoWiFi's
+    `aaa.*` line or vice versa. Each module also keeps its own, separate
+    one-time backup file (`HOST_SMF_CONF_BAK = .../.ocs-smf-conf.bak`, distinct
+    from VoWiFi's own) — never share a backup filename between two modules that
+    both write into the same live file, or the second module's first-write
+    backup silently clobbers the first module's original. **Gy is 4G/EPC-only —
+    SigScale also ships a 5G product (`sigscale/chf`), explicitly excluded from
+    this module's scope**: Open5GS's SMF has zero Nchf client implementation
+    upstream (confirmed live against the real `open5gs/open5gs#4421` GitHub
+    discussion — a community proposal exists, not merged, no timeline), so
+    wiring CHF too would have nothing on the SMF side to ever call it; a 5G NR
+    UE's session is never charged/controlled by this integration at all. Four
+    real bugs found live getting the Gy peer to actually connect (not just
+    "config written, restart succeeded"): (1) OCS's default HTTP port 8080
+    collides with PyHSS's own API service (`/opt/pyhss/services/apiService.py`)
+    — moved to `8093` after confirming 8090/8091/8092 were also taken by other
+    modules; (2) OCS's default `0.0.0.0:3868` Diameter bind can silently lose to
+    another NF's dedicated-IP freeDiameter listener while the Erlang `diameter`
+    application still reports its supervisor "up" — gave OCS its own dedicated
+    loopback `127.0.1.10`, matching every other per-daemon-loopback module in
+    this project; (3) **OCS is NOT accept-by-default for Diameter peers** — it
+    rejects an unrecognized peer with `3010/DIAMETER_UNKNOWN_PEER` until
+    explicitly registered via `ocs:add_client/6`, called over RPC into the real
+    running node (`rpc:call('ocs@open5gs-core', ocs, add_client, [...])` in
+    `addSmfAsOcsClient()`) — a fresh throwaway Erlang node can't call this
+    directly, `add_client` needs Mnesia, which only runs on the real node; (4)
+    OCS's default `Origin-Host`/`Origin-Realm` derive from
+    `inet:gethostname()`/DNS search domain (confirmed live: `open5gs-core`/
+    `example.net` on this host, neither PLMN-related), not anything
+    deployment-specific — freeDiameter rejects the CEA outright until
+    `sys.config`'s diameter options set these explicitly
+    (`originHost`/`originRealm` in `ocs-controller.ts`, defaulting to
+    `ocs.epc.mnc<mnc>.mcc<mcc>.3gppnetwork.org`, derived live from
+    `mme.yaml` — matching the `pcrf.epc...`/`aaa.epc...` naming convention
+    already used for SMF's other peers). `ENABLE_OCS_MODULE` defaults
+    **disabled** (opt-in) — touches an always-on core NF's freeDiameter peer
+    list, same caution class as VoWiFi's S6b line.
+
+18. **cdp (Kamailio's own Diameter module, used by P/I/S-CSCF) behaves
+    differently from freeDiameter (used by every core NF + VoWiFi + OCS's Gy
+    peer) in two real, confirmed-live ways — don't assume freeDiameter
+    knowledge transfers.** Found wiring S-CSCF's Ro (voice/airtime charging,
+    Diameter Application-Id 4 — the same Credit-Control application Gy uses,
+    confirmed via `ocsSysConfig()`'s generic per-application acct/auth
+    structure, so no new OCS-side listener was needed) to SigScale OCS: (1)
+    **cdp resolves `<Peer FQDN="...">` via a real synchronous `getaddrinfo()`
+    at connect time** — same "DNS or die" shape as gotcha #6, just for cdp
+    instead of a core NF's own advertise FQDN. freeDiameter's `ConnectPeer`/
+    `ConnectTo` takes an IP directly and never needed this, so SMF's own Gy
+    peer never surfaced it. If you add a `<Peer>` whose FQDN isn't already
+    covered by this file's own IMS BIND zone, add an `/etc/hosts` entry for
+    it too (`upsertOcsHostsEntry()` in `ims-controller.ts` is the reusable
+    pattern — mirrors the pre-existing HSS peer's own `/etc/hosts` line,
+    `configureIms()` step 9) or cdp fails with a real, reproduced "Name or
+    service not known". (2) **cdp does not bind its outbound Diameter
+    connection to the peer's own configured listen address — freeDiameter
+    does.** Registering S-CSCF's real configured IP (`scscfIp`, e.g.
+    `127.0.1.2`) as OCS's trusted client produced a real, reproduced
+    `3010/DIAMETER_UNKNOWN_PEER` rejection — OCS's own log showed the
+    connection actually arriving from `addresses: [{127,0,0,1}]`, confirmed
+    via `kamcmd -s /run/kamailio_scscf/kamailio_ctl cdp.list_peers` (shows
+    live per-peer `State`, e.g. `I_Open`, plus negotiated Application-Ids —
+    the cdp equivalent of freeDiameter's `STATE_OPEN` grep-the-log check).
+    `ims-controller.ts` now has a dedicated `OCS_CLIENT_SOURCE_IP =
+    '127.0.0.1'` constant, always registered instead of `scscfIp` — this is
+    a genuine cdp behavioral difference, not host-specific config, so it
+    should hold for any future cdp-based Diameter peer this project adds,
+    not just OCS.
+
+## Feature inventory (as of v2.0-beta_0.61, 2026-09-21)
 
 | Feature | Status | Key backend files | Key frontend files |
 |---|---|---|---|
@@ -326,6 +403,12 @@ services**, not containers. This is not a toy/demo app: it manages real CBRS rad
 | UE Signal Monitoring | **new, community-contributed** (PR #32) — per-UE RSRP/RSRQ/SINR/BLER/MCS/CQI/throughput correlated with subscriber identity (IMSI/ICCID/MSISDN), 7-day SQLite history, AES-256-GCM encrypted radio credentials, admin-triggered downlink wake for idle UEs. **Baicells-native connector only** — other vendors need the generic JSON connector, which requires the radio to already expose its own metrics in that shape, so it is not a drop-in for every vendor. `ENABLE_UE_SIGNAL_MODULE` defaults **enabled** (set to `false` to hide it — this is a visibility gate, not an install/uninstall lifecycle like most other opt-in modules). | `radio-signal-controller.ts` | `RadioSignalPage.tsx` |
 | 2G GSM (Osmocom) | **alpha** — real GSM radio access (osmo-bsc/osmo-bts) layered on the osmo-hlr/osmo-msc/osmo-stp that SMS-over-SGs already runs, on real nanoBTS hardware confirmed on-air. CS attach/ciphering, GPRS/EDGE data, and 2G↔4G SMS (via VectorCore SMSC, its own separate module) are **stable**. Real voice calling is **alpha**: osmo-msc's own built-in call handler can complete signaling (ring/answer) but never implements `MNCC_RTP_CREATE` (confirmed live 2026-09-13, upstream Osmocom limitation, not fixable here) — no audio ever flows in Internal mode. Real 2G↔2G audio needs External mode routed through **Asterisk-2G**, a second, fully isolated Asterisk instance (own config tree, own systemd unit, own loopback IP `127.0.1.7` — never touches the separate Asterisk instance PSTN Gateway owns) whose only job is looping a call back through osmo-sip-connector so the second phone gets paged. One button (GSM page's "2G Voice" tab, gated on `ENABLE_ASTERISK_2G_MODULE`, defaults **disabled**) installs, configures, wires the SIP tab's remote peer, and switches MNCC to External automatically. `ENABLE_GSM_MODULE` defaults **disabled** (opt-in) — real radio (and, for a real BTS, actual spectrum transmission) is a bigger blast radius than a broken lab feature. If a real call ever fails at TCH assignment (osmo-bsc logs "Assignment Failure"/"NACK on IPACC CRCX"), it is NOT necessarily a hardware issue — see architectural pattern #16's tail and memory `gsm_2g_osmocom_module_progress.md`: a real `codec-support`/AMR config mismatch caused exactly this, confirmed live 2026-09-15, and had been misdiagnosed as unfixable hardware the day before. | `gsm-controller.ts`, `asterisk-2g-controller.ts`, `osmo-sip-connector-build.ts` | `GsmPage.tsx` |
 | 3G UMTS (OsmoHNBGW) | **alpha** — Home NodeB Gateway bridging a 3G femtocell's Iuh interface to the existing osmo-msc (IuCS) and osmo-sgsn (IuPS) over the already-running osmo-stp. `osmo-hnbgw` isn't an apt package on this host — built from source, pinned to tag `1.3.0` (NOT the `1.9.0` every other daemon here uses — its own version numbering is independent, and `1.9.0` needs a newer `libosmocore` than this host has; confirmed live 2026-09-13 via a real scratch build). Adds a new `cs7`/IuPS point-code block into the 2G module's own `osmo-sgsn.cfg` via ownership-merge (never a blind overwrite — see `vty-config-ownership.ts`), and a third, dedicated OsmoMGW instance (own config/systemd unit/loopback `127.0.1.8`, reusing the already-installed `osmo-mgw` binary). `osmo-stp.cfg`/`osmo-msc.cfg` need **zero changes** — confirmed live from both HNBGW's and MSC's own logs (STP's existing dynamic-ASP-registration + MSC's existing SCCP link both already handle it). Subscriber credentials need no new provisioning either — reuses the 2G module's own `gsmEnabled` flag and its `auc_3g` MILENAGE row (confirmed via OsmoHLR's own manual: the same row serves both 2G and full UMTS AKA). A software test HNB, **OsmoHNodeB** (tag `0.1.0`, same source-build pattern, needs its own dedicated GTP-U bind `127.0.1.9` — its default collides fatally with Open5GS's own UPF), deployable from the module's own page, proved a full live HNBAP registration end-to-end before any real hardware was touched. Real hardware target: an ip.access nano3G — unlike 2G's OML, Iuh/HNBAP has no remote-provisioning push, so a real HNB self-registers once pointed at this gateway's IP on its own local config, rather than being discovered/pushed-to from this NMS. `ENABLE_HNBGW_MODULE` defaults **disabled** (opt-in). | `hnbgw-controller.ts`, `osmo-hnbgw-build.ts`, `osmo-hnodeb-build.ts` | `HnbPage.tsx`, RAN page's "3G UMTS" section |
+| SigScale OCS (Online Charging, Diameter Gy) | **beta** — real-time prepaid credit-control charging for 4G/EPC PDN sessions, wiring Open5GS SMF's own native Gy client (present since v2.4.7, previously completely dormant in this deployment) to a newly-installed SigScale OCS (Erlang/OTP, real apt package via a pinned Google-Cloud-hosted `.deb`, not source-built). Full one-button Configure: writes OCS's own `sys.config`, registers SMF as a trusted Diameter client via `ocs:add_client/6` (RPC into the real running node — Mnesia only works there, not on a throwaway node), upserts the `ocs.*` Gy `ConnectPeer` into `smf.conf`, restarts `open5gs-smfd`, and verifies a real `STATE_OPEN` Gy connection from SMF's own log — end-to-end confirmed live 2026-09-16. **4G/EPC only — 5G NR sessions are never charged by this integration**; see architectural pattern #17 for why SigScale's 5G product (`chf`) was researched and explicitly excluded (Open5GS SMF has no Nchf client upstream). Pattern #17 also covers the 4 real bugs found getting the Gy peer to actually connect (port conflict, wildcard-bind conflict, default-deny client registration, Origin-Host/Realm mismatch) and the exclusive-naming-slot scheme that lets this module and VoWiFi both safely own one `ConnectPeer` line each inside the same `smf.conf`. No rating-plan/balance/subscriber CRUD in this NMS — Setup tab links out to OCS's own Polymer web GUI and REST API docs instead, matching this project's established "link out, don't reimplement" convention for full third-party apps. **Voice/airtime charging (Diameter Ro), added 2026-09-17, confirmed fully working end-to-end** — completes the dormant `#!ifdef WITH_RO` block `kamailio_scscf.cfg` already carried (same "built, left disabled" shape as pattern #13's Rx interface); shares OCS's existing Gy listener (same Diameter Application-Id 4), new `setVoiceChargingEnabled()`/`POST /api/ims/voice-charging` toggle (in `ims-controller.ts`, defaults **off**, same risk class as Gy). Getting a real call to actually complete took 2 cdp-vs-freeDiameter connectivity bugs (architectural pattern #18) plus **five separate real bugs inside the compiled `ims_charging.so` module itself** — duplicate Origin-Host/Realm AVPs, two AVPs that don't belong in a CCR at all (Accounting-Record-Type/Number, Vendor-Specific-Application-Id), a missing mandatory Auth-Application-Id, and a subscriber-identity format (`sip:` URI vs `tel:` URI) OCS's lookup didn't recognize — every one confirmed via OCS's own `erlang.log`, not guessed. All five are now real unified-diff patches baked into `kamailio-ims-modules-build.ts` (`CCR_C_PATCH`/`IMS_RO_C_PATCH`, same `apt-get source` → `patch` → build → ABI-verify → `.apt-original`-backup → deploy pipeline already used for `ims_ipsec_pcscf`/`ims_registrar_pcscf`), not just hand-patched on one host — independently verified by running the real generator script end-to-end against a fresh source fetch. Full bug-by-bug writeup: memory `sigscale_ocs_module_progress`. `ENABLE_OCS_MODULE` defaults **disabled** (opt-in). | `ocs-controller.ts` | `OcsPage.tsx` |
+| Charging Plans (simple data + voice caps GUI) | **beta, voice half confirmed working end-to-end 2026-09-17** — a deliberately simplified layer over SigScale OCS's own full rating-plan vocabulary, per explicit user request ("the sigscale gui is to complex"). One GUI "Plan" (name + data cap GB + voice cap minutes) = one OCS bundle offer referencing a data sub-offer (`specification="4"`) and a voice sub-offer (`specification="5"`, source-confirmed correct against the real rating engine's `?IMSVOICE` guard). New `nms_charging_plans` Mongo collection mirrors Subscriber Groups' own CRUD/assignment shape exactly; subscriber assignment reachable both from the Subscribers page's bulk-select toolbar AND a per-row "Set plan" control in the Plan column (added after the bulk-only flow proved hard to discover). **Real bug, found chasing a usage readout stuck at 0 despite a confirmed real charge**: `assignSubscribersToPlan()` linked a subscriber's IMSI and MSISDN to OCS **separately**, landing them on two disconnected products with independent buckets — Gy (data) keys off IMSI, Ro (voice) keys off MSISDN, so a subscriber's data and voice usage silently drew from unrelated pools. Fixed to link every identity for one subscriber to a single shared product atomically; full mechanics (including a second bug in the fix's own "already linked" short-circuit) in memory `sigscale_ocs_module_progress`. Depends on SigScale OCS being installed/configured first; the voice half additionally depends on the Ro toggle above. **An "Unlimited" plan (1,000,000 GB / 1,000,000 min — a deliberately huge finite cap, not a dedicated no-cap code path, to avoid exercising an untested interaction with the still-unresolved `charge2` crash below) is auto-provisioned by `ensureDefaultUnlimitedPlan()` on every OCS Configure, idempotent by plan name.** A cap at/above 100,000 GB or minutes renders as "Unlimited" in the UI instead of the raw number (`ChargingPlansPage.tsx`, `TrafficHistoryPage.tsx`, and the Subscribers page's plan dropdown all apply this). A real, still-unresolved **OCS-side rating-engine bug** (`ocs_rating:charge2`, `function_clause` on `type: final`/termination) periodically leaks stuck Gy/Ro reservations across multiple subscribers — no longer needs manual intervention: `OcsReservationGuard` (`backend/src/application/use-cases/ocs/ocs-reservation-guard.ts`, started unconditionally in `index.ts`, on by default) sweeps every 30 minutes and clears any reservation entry older than 2 hours via a balance-preserving Mnesia write (`remain` never touched, verified live). The deep root cause itself is still not fixed (no exact-version source obtainable for the installed 3.4.73 release, and the `.beam` has neither debug info nor an exported `charge2` to probe) — the guard is a mitigation, not a patch. Full diagnostic arc, including a complete captured crash dump and the recommended next step (file it as a SigScale GitHub issue), in memory `sigscale_ocs_module_progress`. | `charging-plans-controller.ts`, `ocs-reservation-guard.ts` | `ChargingPlansPage.tsx` |
+| Call History (CDR module) | **beta** — unified call detail records across PSTN, 2G, and 4G/5G IMS, synced into a new `nms_cdr` Mongo collection (retention-configurable TTL index, default 180 days) from each system's own real source rather than a new primary store (same CLAUDE.md pattern #12 distinction as Traffic History vs. Prometheus). Three independent phases, staged by risk: **Phase 1** (PSTN Gateway Asterisk CSV tailing) stable, verified against a real 76+-row dataset. **Phase 2** (Asterisk-2G) — fixed a real bug where `asterisk-2g-controller.ts` never created the `cdr-csv/` subdirectory `cdr_csv.so` needs, so it silently never wrote a single record; code deployed, but a real end-to-end test-call confirmation is still outstanding. **Phase 3** (direct 4G/5G IMS-to-IMS calls, the one path with no B2BUA CDR of its own) — Kamailio's own `acc` module, basic flag-based `db_flag`/`db_missed_flag` accounting (deliberately NOT `acc`'s newer `cdr_enable`, which needs a module literally named `dialog` that this deployment doesn't load — see `ims-controller.ts`'s `scscfIncludeCfg()` comment), gated behind its own `WITH_CDR` build flag plus a runtime toggle (`setCdrAccountingEnabled()`, "Direct IMS Call Recording" on the Call History page's Settings panel) independent of the module's own compile-time gate, same shape as OCS's Ro toggle. **Confirmed fully working end-to-end live 2026-09-17** against 3 real test calls (answered, a rang-then-fell-to-voicemail call, and a PSTN-Gateway-routed call captured correctly as its real two separate B2BUA-split dialogs) — see architectural pattern #16's sibling gotcha (added this same day) on why the live host's static template was stale and needed a manual redeploy before the toggle could do anything. `missed_calls` (busy/rejected calls) is implemented per Kamailio's well-documented, stable module behavior but not yet empirically verified live — no real busy-call test was available this session. A voicemail pickup is indistinguishable from a normal human answer at the SIP/`acc` level (both are real 2xx-terminated INVITE transactions) — documented in the UI's info banner, not a bug. Full arc: memory `cdr_module_progress`. | `cdr-store.ts`, `cdr-sync-monitor.ts`, `cdr-controller.ts` | `CallHistoryPage.tsx` |
+
+| IP Plan Tool | **beta** — bulk re-address a whole deployment from one page instead of visiting every module's own, via an explicit "Propose → review → Apply" flow (never an ambient background sync — a full redesign after direct user correction of the original silent-write-back version). `GET /api/ip-plan` always reads each module's own **current** live state fresh, never a registry; `POST /api/ip-plan/propose {subnet}` is a pure preview computing non-colliding suggestions (`ip-suggest.ts`); `POST /api/ip-plan/apply` is the only write path, an async job (`ip-plan-apply-usecase.ts`, same polling pattern as `module-fixall-usecase.ts`) that live-applies opt-in-per-row for secgw-gateway/vowifi-epdg/gsm-bsc-mgw+gsm-sgsn-gb/ims-pcscf+ims-rtpengine/pstn-external-trunk/mms-mm1/all 7 core-17 address fields (batched into one `AutoConfigUseCase.execute()` call, `applyInterfaces`/`applyPfcp` toggled only for groups actually touched, `localUpfOnly`/`localSgwuOnly` explicitly forced off when a PFCP field is checked since that flag would otherwise silently no-op the change) — while sepp-sbi/sepp-n32c/sepp-n32f/bind-dns are **registry-only, unconditionally**, since SEPP's only live-apply path is a full 17-NF core restart, disproportionate for 3 fields. IMS is ordered before PSTN/MMS in the same batch (both depend on it) with an explicit short-circuit if IMS's own step fails partway through a run. The old bulk-save route and its frontend client method were deleted outright as part of the rewrite (not just stopped being called) — a deliberate verification mechanism so any stale call site fails to compile instead of silently doing nothing; confirmed zero remaining `ipPlanApi.save()` call sites anywhere in the frontend. **Not yet independently confirmed with a live Propose → Apply click-through** — built and audited against its own approved plan with no deviations found, but that audit was a static code read, not a live test. | `ip-plan-controller.ts`, `ip-plan-apply-usecase.ts`, `ip-suggest.ts`, `main-interface.ts` | `IpPlanTab.tsx` (a tab on the Auto-Configuration Wizard page) |
+| RAN Kill Switches (Dashboard) | **beta** — five header buttons (Block RAN, plus Block 2G/3G/4G/5G individually) that bulk-block every currently connected/registered radio of that generation, each flashing red (`animate-flash-red`) for as long as anything of that generation is currently blocked and doubling as the unblock-all action while flashing (explicit user request). 4G (`radio-block-controller.ts`) and 5G (`gnb-block-controller.ts`) reuse pre-existing nftables mechanisms unchanged. **3G had no blocking mechanism of any kind before this feature** — built `hnb-block-service.ts`/`sqlite-hnb-block-repository.ts`/`hnb-block-controller.ts` from scratch mirroring `gnb-block-service.ts`'s exact shape (own nftables table `open5gs_nms_hnb_block`), with one real difference from every other generation's block service: HNBGW's Iuh port is operator-configurable in this project (`HnbgwState.iuhLocalPort`, unlike S1AP/NGAP's fixed 3GPP port numbers), so the service reads it live via an injected `getIuhPort()` callback and encodes the port into each rule's own tracking comment (`hnb_block_<ip>_<port>`) so a port change while blocked is detected as "no longer desired" by the existing reconcile loop instead of silently leaving a dead rule. 2G reuses the real per-BTS osmo-bsc admin-lock (`blockBtsByIdx`, extracted from the pre-existing single-BTS route so the new bulk `/bts/block-all` route can drive it) — genuinely different blast radius (drops camped UEs immediately, real device impact) than the other three's mild host-only nftables rules, so its button/copy are deliberately distinct rather than looking identical. **Building this feature's 2G path surfaced a real, long-standing bug — see the 2G GSM gotcha below.** | `radio-block-controller.ts`, `gnb-block-controller.ts`, `hnb-block-controller.ts`, `gsm-controller.ts` | `DashboardPage.tsx`, `RANPage.tsx` (same flash-red treatment extended to every individual per-radio Block/Unblock button) |
 
 Full detail on any of these: `docs/features.md`.
 
@@ -407,6 +490,58 @@ Full detail on any of these: `docs/features.md`.
   `colors`, and `nms-checkbox` used on 11+ checkboxes with no CSS rule at all.
   If you add a new `nms-*`-prefixed class or color token, grep both
   `index.css` and `tailwind.config.js` first to confirm it actually exists.
+- **A static IMS Kamailio template (`kamailio_scscf.cfg`/`pcscf.cfg`/etc.) only
+  reaches the live host via `deployImsTemplate()`, which only runs inside a
+  full IMS Install/Configure — none of the lightweight per-feature toggle
+  setters (`setSmsDeliveryMode()`, `setVoiceChargingEnabled()`,
+  `setCdrAccountingEnabled()`, etc.) ever call it.** Those setters only
+  rewrite the small *generated* include file (`scscf.cfg`) and restart the
+  one affected service — editing the static template source in this repo and
+  then just flipping a toggle does NOT redeploy your edit. Found live
+  2026-09-17 wiring CDR Phase 3: `kamailio_scscf.cfg`'s live host copy was
+  stale by a full day, missing both that day's earlier Ro/voice-charging
+  origin-host fix AND the new WITH_CDR blocks — `setCdrAccountingEnabled(true)`
+  restarted `kamailio-scscf` and reported success, but the running config
+  still had no `acc` module loaded at all, since only the *generated*
+  `scscf.cfg` had been rewritten. If you edit a static IMS template's source
+  and need it live without a full re-Configure, redeploy that one file
+  manually (copy the built `dist/config/ims-templates/.../*.cfg` to its real
+  host path) before restarting the service — don't assume any toggle setter
+  did it for you.
+- **The 2G BTS Block/Unblock feature (`gsm-controller.ts`) never actually
+  worked, since the day it was first built — a background osmo-bsc
+  reconciliation loop silently overrode it every time, with zero error
+  anywhere.** Only discovered 2026-09-21 because the RAN Kill Switches
+  Dashboard feature finally gave this route its first-ever real UI trigger.
+  The original command, `change-adm-state locked` sent at the `(oml)`
+  pseudo-node (targeting NM object class "bts" directly), is accepted with
+  zero VTY error and zero journalctl error — but osmo-bsc's own
+  `nm_bts_fsm.c`'s `configure_loop()` runs a background reconciliation that
+  silently re-unlocks any "bts"-class object it considers should be in
+  service, with no guard against a manual lock at that level. Confirmed live
+  by locking, then re-reading `show bts N` immediately and repeatedly over
+  8+ seconds — Admin state never left 'Unlocked', and the OML Link's own
+  uptime counter never reset either (ruling out a reconnect race, not just a
+  timing issue). Root-caused by reading osmo-bsc 1.9.0's real source
+  (`apt-get source osmo-bsc`, not guessed) — `rf_locked (0|1)`, a
+  config-tree command on the TRX object specifically (`configure terminal`
+  → `network` → `bts N` → `trx N`), is the real, sticky mechanism: it sets
+  `trx->mo.force_rf_lock`, the one guard the equivalent TRX-level
+  reconciliation loop in `nm_rcarrier_fsm.c` DOES check before
+  auto-re-unlocking. Fixed in both `blockBtsByIdx` (the interactive route)
+  and `reapplyBtsLocks()` (the restart-recovery counterpart, which means
+  **this also silently never worked for the entire time the 2G module has
+  existed** — any BTS marked `blocked` never actually came back locked
+  after an osmo-bsc restart). The verify query also had to change: `show
+  bts N` has no per-TRX NM State line at all — `show trx N 0` is what
+  prints the TRX's own "Radio Carrier NM State", which
+  `parseBtsLinkStatus`'s existing regex still matches unmodified. If you
+  ever add another osmo-bsc administrative-state action, don't assume
+  `change-adm-state` at a low-level NM pseudo-node actually sticks for
+  every object class — check whether that class's own FSM has a
+  `configure_loop()`-style reconciliation loop first, and whether a
+  dedicated `force_rf_lock`-style config-tree command already exists for
+  it.
 
 ## User / workflow conventions
 

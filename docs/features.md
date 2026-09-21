@@ -20,9 +20,22 @@ Detailed documentation for all Open5GS NMS features.
 12. [Backup & Restore](#backup--restore)
 13. [Audit Trail](#audit-trail)
 14. [IMS / VoLTE](#ims--volte)
-15. [VoWiFi (ePDG)](#vowifi-epdg)
-16. [SMS over SGs](#sms-over-sgs)
-17. [UE Validation](#ue-validation)
+15. [2G GSM (Osmocom)](#2g-gsm-osmocom)
+16. [3G UMTS (OsmoHNBGW)](#3g-umts-osmohnbgw)
+17. [PSTN Gateway](#pstn-gateway)
+18. [VoWiFi (ePDG)](#vowifi-epdg)
+19. [SMS over SGs](#sms-over-sgs)
+20. [UE Validation](#ue-validation)
+21. [Security Gateway (SecGW)](#security-gateway-secgw)
+22. [RF Planning](#rf-planning)
+23. [IP Plan Tool](#ip-plan-tool)
+24. [RAN Kill Switches (Dashboard)](#ran-kill-switches-dashboard)
+25. [SigScale OCS (Online Charging, Diameter Gy + Ro)](#sigscale-ocs-online-charging-diameter-gy--ro)
+26. [Charging Plans](#charging-plans)
+27. [Call History (CDR)](#call-history-cdr)
+28. [Traffic History](#traffic-history)
+29. [UE Signal Monitoring](#ue-signal-monitoring)
+30. [SNMP Monitoring](#snmp-monitoring)
 
 ---
 
@@ -1271,6 +1284,623 @@ Spins up a containerized test UE — **srsRAN** for 4G (eNB+UE in one container,
 
 - **4G:** fully verified end-to-end, including idle-mode paging and wake (attach → idle → page → wake → bidirectional ping)
 - **5G:** connected-state reachability fully verified; idle-mode paging is **unconfirmed** — UERANSIM's simulated gNB may not implement an inactivity timer the same way a real eNB does
+
+---
+
+## Security Gateway (SecGW)
+
+> **Alpha.** Real IPsec tunnels are confirmed live in production for both
+> supported radio vendors simultaneously, but the module is still early —
+> `ENABLE_SECGW_MODULE` defaults to **disabled** (opt-in), unlike most
+> optional modules in this project.
+
+### What It Does
+
+Terminates IPsec (strongSwan/`ipsec`) tunnels between this host and each
+attached radio, so S1AP/GTP-U traffic to the core network functions rides
+inside an authenticated, encrypted ESP tunnel instead of plaintext. Each
+radio gets its own dedicated pool address / traffic selector — never a
+shared CIDR, because shared selectors collide on a single kernel XFRM
+policy slot, and whichever radio negotiates last silently steals it from
+the others (they still show `ESTABLISHED` in `swanctl`, but with no real
+traffic path — a real production outage this project hit before fixing
+it).
+
+Baicells and Nokia radios are configured through **fundamentally
+different IPsec models**, and the module has to know which one it's
+talking to:
+
+- **Baicells** negotiates its tunnel address dynamically via IKEv2
+  Configuration Payload (CP) — the gateway hands out a pool address per
+  radio at negotiation time (`allocatePoolAddress()`).
+- **Nokia AirScale has no CP support at all** (confirmed by reading the
+  radio's own IPsec configuration page directly) — it only offers static
+  tunnel endpoints and traffic selectors as one or more standalone
+  "Protect" policies. For Nokia, `remote_ts`/`remote_addrs`/the IKE
+  identity all have to be the radio's own real IP address, never the
+  pool/CP mechanism. If a Nokia radio needs to reach anything beyond the
+  auto-derived core-NF pair (for example the BIND DNS server), that's
+  added via `extraLocalCidrs` as a real additional "Protect" policy on the
+  radio's own side, matched by widening this gateway's `local_ts` — the
+  radio's "Bypass" IPsec action isn't reliably usable for this.
+
+### Components
+
+- **Backend**: `secgw-controller.ts` — Install/Configure/Start/Stop
+  lifecycle, per-radio pool/traffic-selector allocation, vendor-specific
+  config generation. `secgw-build.ts` — strongSwan install/build plumbing.
+- **Frontend**: `SecGWPage.tsx` — tunnel status, per-radio configuration.
+- **strongSwan (`ipsec`/`swanctl`)** — the actual IPsec daemon doing tunnel
+  negotiation and ESP encryption/decryption.
+
+### Real bugs found and fixed getting this working end-to-end
+
+- **Shared traffic-selector CIDR caused a real multi-radio outage.** Every
+  radio was originally configured with the same pool CIDR as its traffic
+  selector. The kernel only keeps one XFRM policy per selector, so the
+  *last* radio to negotiate silently won that policy slot — every other
+  radio's tunnel showed `ESTABLISHED` in `swanctl` (looking completely
+  healthy) while carrying zero real traffic. Fixed by giving every radio
+  its own unique single-address pool/traffic-selector via
+  `allocatePoolAddress()`.
+- **Nokia's lack of IKEv2 Configuration Payload support wasn't discovered
+  from documentation — it was confirmed live** by reading the radio's own
+  IPsec page directly, after an approach built for Baicells' CP-based
+  model didn't work for Nokia. The fix (`resolveRemoteTs()`) branches
+  vendor behavior explicitly rather than trying to find one configuration
+  shape that works for both.
+
+### Current Status
+
+Alpha — real IPsec tunnels confirmed live simultaneously for 3 Baicells
+eNBs (CP/virtual-IP based) and 1 Nokia AirScale (static endpoints, no CP),
+with real S1AP/GTP-U traffic verified flowing through the tunnel via
+packet capture (ESP wrapper + a decrypted SCTP heartbeat to the MME).
+`ENABLE_SECGW_MODULE` defaults disabled — opt-in only.
+
+---
+
+## RF Planning
+
+> **Alpha, actively being built out.** This is Phase 1 of a planned
+> multi-phase tool — expect incomplete phases and possible breaking
+> changes between releases. `ENABLE_RF_PLANNING_MODULE` defaults to
+> **disabled** (opt-in).
+
+### What It Does
+
+A deterministic LTE link-budget and site-geometry planning engine — the
+first phase of a longer-term goal to build a full, practically useful RF
+planning tool (in the spirit of commercial tools like Atoll or iBwave,
+including eventual PDF report export), not just a set of standalone
+calculators. Phase 1 focuses on the deterministic math itself
+(link-budget and geometry calculations); later phases are planned but not
+yet built.
+
+### Components
+
+- **Backend**: `rf-planning-controller.ts`, `rf-planning-projects-controller.ts`,
+  `rf-planning-reports-controller.ts`.
+- **Frontend**: `RfPlanningPage.tsx`.
+
+### Design Notes
+
+This phase's design was reviewed before implementation began, and two
+real errors were found and fixed in the original specification itself
+during that review — caught before any code was written, not after.
+Because this module is still under active, phased construction, treat
+anything not explicitly confirmed elsewhere in this documentation as
+subject to change.
+
+### Current Status
+
+Alpha — Phase 1 (the deterministic engine) only. `ENABLE_RF_PLANNING_MODULE`
+defaults disabled. Do not assume feature parity with a commercial RF
+planning tool yet; later phases are planned, not built.
+
+---
+
+## IP Plan Tool
+
+> **Beta.** A bulk IP-address planning/apply tool, not a source of truth — it
+> never overwrites a module's own IP unless you explicitly run it, and it always
+> shows you a proposed plan to review before anything is applied. SEPP's three
+> address fields and the DNS/BIND9 listen address are plan-only by design —
+> applying either live goes through their own dedicated pages, since a SEPP
+> address change's only real apply path is a full 17-NF core restart.
+
+### What It Does
+
+Re-addressing a deployment after standing it up used to mean visiting every
+module's own page one at a time and manually re-typing the same new subnet
+into each one. This tool turns that into one guided flow:
+
+1. **Propose** — click "Propose IP Plan," either accept the auto-detected
+   primary interface's subnet or type a different one, and the tool reads
+   every module's own *current* live state (never a cached/stale value) and
+   proposes a non-colliding address for anything that's still pointing at a
+   gap (a loopback default, or never configured at all). A module that's
+   already pointing at a real, live address proposes no change and starts
+   unchecked — nothing gets touched unless you actually check its row.
+2. **Review** — the plan table shows current vs. proposed side by side, a
+   checkbox per row, and — for anything capable of applying live — a plain-
+   English restart-cost hint (a single core-17 field restarts only the NF
+   whose file actually changed; IMS is the heaviest, 14+ sequential service
+   restarts).
+3. **Apply** — click "Apply Plan." Checked rows that are live-apply-capable
+   get pushed to their real module's own configure function immediately
+   (restarting only what that module's own logic decides needs restarting);
+   everything else — including SEPP and BIND9's listen address, always — is
+   just saved to a small planning registry for that module's own page to
+   pre-fill from later.
+
+### Components
+
+- **Backend**: `ip-plan-controller.ts` (routes), `ip-plan-apply-usecase.ts`
+  (the actual per-module dispatch — an async job, same polling pattern as the
+  module-wide "Fix All" action, since a full batch touching IMS can run
+  minutes long), `ip-suggest.ts` (non-colliding address suggestion within a
+  subnet), `main-interface.ts` (detects the host's own primary interface/CIDR
+  for the subnet pre-fill).
+- **Frontend**: `IpPlanTab.tsx`, a tab on the Auto-Configuration Wizard page —
+  idle view (current values only) → proposed view (editable, checkboxed,
+  restart-cost hints) → live per-row apply-result badges while a run is in
+  progress.
+
+### Live-apply coverage
+
+| Applies live (opt-in per row) | Plan-only, always |
+|---|---|
+| Core-17: MME S1-MME, SGW-U S1-U, AMF NGAP, UPF N3, SMF/SGW-C/local-UPF PFCP (batched into one Auto-Configuration apply per run) | SEPP: SBI, N32-C, N32-F |
+| Security Gateway | BIND9/DNS listen address |
+| VoWiFi ePDG | |
+| 2G GSM (osmo-bsc/MGW, osmo-sgsn Gb) | |
+| IMS (P-CSCF, RTPEngine) | |
+| PSTN Gateway's external trunk | |
+| MMS MM1 proxy | |
+
+IMS is always applied before PSTN/MMS within the same batch, since both of
+those depend on IMS already being configured — if IMS's own step fails
+partway through a batch, PSTN/MMS entries in that same run are marked failed
+outright rather than attempted against a half-applied IMS.
+
+### Design history
+
+The first version of this tool worked the opposite way: it silently wrote
+back to a shared registry after every module's own independent Configure
+action, and every module's page silently read from that registry on load.
+That's an ambient background-sync mechanism with no single moment an operator
+actually decided to change anything — corrected after direct user feedback
+that the tool should only ever act on an explicit "Propose → Apply" click,
+never as a side effect of using some other page normally. The rewrite deleted
+the old bulk-save endpoint and its frontend client method outright, rather
+than leaving them in place unused — a deliberate choice so any accidentally-
+still-present call site would fail to compile instead of silently doing
+nothing.
+
+### Current Status
+
+Beta — built and code-reviewed, matches its own design exactly (independently
+audited against the approved plan with no deviations found), but not yet
+independently confirmed with a live Propose → Apply click-through end-to-end.
+Known edge case: an MME/AMF interface currently bound by interface name
+(`dev:`) rather than a static address reads as "not configured" and applying
+a plan there converts it to address-binding — a real behavior change beyond
+just the IP itself, not specially called out in the UI yet.
+
+---
+
+## RAN Kill Switches (Dashboard)
+
+> **Beta.** Real, disruptive actions on live radios — not a simulation. The
+> 2G button in particular has genuinely different real-world impact than the
+> other three (see below); read the confirmation dialog before clicking any
+> of them on a system with real attached traffic.
+
+### What It Does
+
+Five buttons on the main Dashboard header let an operator take radios
+offline from the NMS side without touching any radio's own configuration:
+**Block RAN** (all four generations at once), and **Block 2G** / **Block
+3G** / **Block 4G** / **Block 5G** individually. Each one bulk-blocks every
+currently connected/registered radio of that generation with one click, and
+each button flashes red for as long as anything of that generation is
+currently blocked — clicking a flashing button unblocks everything of that
+generation instead of re-blocking.
+
+The four generations are **not** the same mechanism underneath:
+
+- **4G and 5G** sever the radio's own control-plane and user-plane paths to
+  the core (S1-MME+S1-U, or N2+N3) via a dedicated nftables table on this
+  host only — the radio itself is never touched, never rebooted, never
+  reconfigured, and can be restored instantly.
+- **3G** severs the HNB's Iuh path to HNBGW the same way (nftables, host
+  only) — just one port, since a femtocell's actual voice/data traffic never
+  touches the HNB directly (it's Iu-CS/Iu-PS from HNBGW onward).
+- **2G is a real, different kind of action**: it administratively locks the
+  BTS at osmo-bsc itself (the same mechanism as the RAN page's own per-BTS
+  Block button) — every camped UE drops immediately and the cell stops
+  broadcasting until unlocked. This is a real device-level action, not a
+  host-only network rule, and the UI deliberately makes it look and read
+  differently from the other three so an operator never mistakes one for
+  the other.
+
+### Components
+
+- **Backend**: `radio-block-controller.ts`/`radio-block-service.ts` (4G, one
+  of the original per-radio block mechanisms this project shipped),
+  `gnb-block-controller.ts`/`gnb-block-service.ts` (5G, an exact structural
+  mirror), `hnb-block-controller.ts`/`hnb-block-service.ts` (3G, built new —
+  see below), `gsm-controller.ts`'s `blockBtsByIdx`/`/bts/block-all` (2G,
+  reuses the real osmo-bsc admin-lock).
+- **Frontend**: `DashboardPage.tsx` (the five buttons + confirm dialogs),
+  `RANPage.tsx` (the same flash-red treatment on every individual per-radio
+  Block/Unblock button, not just the aggregate Dashboard ones).
+
+### Real bugs found and fixed getting this working end-to-end
+
+- **3G had no blocking mechanism of any kind before this feature.** Built
+  from scratch, mirroring the 4G/5G nftables pattern exactly — with one real
+  difference: 3G's Iuh port is operator-configurable in this project (unlike
+  S1-MME/N2's fixed 3GPP port numbers), so the port is read live rather than
+  hardcoded, and encoded into each nftables rule's own tracking comment — a
+  port change while a block is active is detected as "the old rule is no
+  longer correct" by the existing reconcile loop, instead of silently
+  leaving a stale rule in place that blocks nothing while still looking
+  active.
+- **The 2G BTS Block/Unblock feature had never actually worked, since the
+  day it was first built** — only discovered because this feature finally
+  gave it its first-ever real UI trigger and someone actually clicked it.
+  The command it sent (`change-adm-state locked` at a low-level NM
+  pseudo-node) was accepted with zero error of any kind, anywhere — but
+  osmo-bsc runs a background reconciliation loop that silently re-unlocks
+  that exact class of object on its own, with no way to tell it to stop from
+  that command. Root-caused by reading osmo-bsc's own real source code
+  (not guessed) and fixed with a completely different, correct command
+  (`rf_locked`, which does have the guard the other one lacked) that lives
+  in a different part of osmo-bsc's VTY entirely.
+
+### Current Status
+
+Beta. 4G/5G blocking reuses long-proven mechanisms. 3G's new nftables
+service has not yet been exercised against real 3G hardware traffic (the 3G
+module itself is still alpha). The 2G fix has been rebuilt, redeployed, and
+confirmed clean on the radio's own live state, but not yet independently
+confirmed by clicking the button through a real UI action end-to-end.
+
+---
+
+## SigScale OCS (Online Charging, Diameter Gy + Ro)
+
+> **Beta.** Real-time prepaid credit-control charging for 4G/EPC sessions only —
+> 5G NR sessions are never charged by this integration, since Open5GS's SMF has
+> no Nchf (5G online-charging) client upstream at all. Voice/airtime charging
+> (Ro) is a separate toggle, defaulting **off**, same risk class as data (Gy) —
+> both touch an always-on core NF's live Diameter peer list. `ENABLE_OCS_MODULE`
+> defaults **disabled** (opt-in).
+
+### What It Does
+
+Open5GS's SMF has shipped a native Diameter Gy client since v2.4.7, but it sat
+completely dormant in this deployment until this module wired it to something.
+SigScale OCS (Erlang/OTP, a real third-party Online Charging System, installed
+as an apt package from a pinned Google-Cloud-hosted `.deb`, not source-built)
+is that something:
+
+1. **Configure** writes OCS's own `sys.config`, registers SMF as a trusted
+   Diameter client via `ocs:add_client/6` (RPC'd into the real running Erlang
+   node — Mnesia only works there, not on a throwaway node), upserts a Gy
+   `ConnectPeer` line into `smf.conf`, restarts `open5gs-smfd`, and verifies a
+   real `STATE_OPEN` Gy connection from SMF's own log.
+2. With Gy connected, every 4G/EPC PDN session SMF creates is now subject to
+   real prepaid credit-control — a subscriber with an exhausted balance is
+   genuinely cut off, not just logged.
+3. **Voice/airtime charging (Ro)**, a separate later addition, completes a
+   dormant `#!ifdef WITH_RO` block `kamailio_scscf.cfg` already carried. It
+   shares OCS's existing Gy listener (same Diameter Application-Id 4,
+   Credit-Control) and is toggled independently via `setVoiceChargingEnabled()`.
+
+No rating-plan/balance/subscriber CRUD lives in this NMS — the Setup tab links
+out to OCS's own Polymer web GUI and REST API docs instead, matching this
+project's "link out, don't reimplement" convention for full third-party apps.
+(The **Charging Plans** feature, documented separately below, is a deliberately
+simplified GUI layer on top of this.)
+
+### Components
+
+- **Backend**: `ocs-controller.ts` — Install/Configure lifecycle, the Gy
+  `ConnectPeer` upsert (`upsertSmfGyPeer()`/`removeSmfGyPeer()`), the
+  `ocs:add_client/6` RPC registration, the Ro toggle.
+- **Frontend**: `OcsPage.tsx` — status, install/configure controls, links out
+  to OCS's own admin UI.
+- **SigScale OCS**: the real charging engine — Erlang/OTP, its own Mnesia
+  database, its own Diameter (Gy/Ro) and HTTP (REST/Polymer GUI) listeners.
+
+### Real bugs found and fixed getting this working end-to-end
+
+- **`smf.conf` now carries three independently-owned `ConnectPeer` lines** (Gx
+  from Open5GS core itself, S6b from VoWiFi, Gy from this module) — each
+  module's upsert function is regex-scoped to strip only its own naming prefix
+  (`ocs.*` for this one), never the whole file, and each keeps its own
+  separate one-time backup file so a second module's first write can't
+  silently clobber the first module's original.
+- **Port conflict**: OCS's default HTTP port 8080 collided with PyHSS's own
+  API service — moved to 8093 after confirming 8090–8092 were also taken by
+  other modules.
+- **Wildcard-bind conflict**: OCS's default `0.0.0.0:3868` Diameter bind can
+  silently lose to another NF's dedicated-IP freeDiameter listener while the
+  Erlang `diameter` application still reports its own supervisor "up" — gave
+  OCS its own dedicated loopback, `127.0.1.10`.
+- **OCS is not accept-by-default for Diameter peers** — it rejects an
+  unrecognized peer with `3010/DIAMETER_UNKNOWN_PEER` until explicitly
+  registered via `ocs:add_client/6`, which needs Mnesia and so must run as an
+  RPC into the real node, not a throwaway one.
+- **Origin-Host/Origin-Realm mismatch**: OCS's defaults derive from the host's
+  own hostname/DNS search domain, not anything PLMN-related — freeDiameter
+  rejects the CEA outright until `sys.config`'s diameter options set these
+  explicitly to a real, deployment-specific identity.
+- **cdp (Kamailio's own Diameter stack, used for Ro) behaves differently from
+  freeDiameter (used for Gy) in two ways that cost real debugging time**: (1)
+  cdp resolves a configured Peer FQDN via a real synchronous DNS lookup at
+  connect time — freeDiameter takes an IP directly and never needed this, so
+  it never surfaced the gap; any Peer FQDN not already covered by this
+  project's own IMS BIND zone needs an `/etc/hosts` entry too, or cdp fails
+  outright. (2) cdp does **not** bind its outbound Diameter connection to the
+  peer's own configured listen address the way freeDiameter does — registering
+  S-CSCF's real configured IP as OCS's trusted client produced a real
+  `3010/DIAMETER_UNKNOWN_PEER` rejection, because the connection actually
+  arrived from `127.0.0.1`. Fixed with a dedicated `OCS_CLIENT_SOURCE_IP`
+  constant, always registered instead of the peer's nominal IP.
+- **Five separate real bugs inside the compiled `ims_charging.so` module
+  itself**, found getting a real Ro call to complete, all confirmed via OCS's
+  own `erlang.log` rather than guessed: duplicate Origin-Host/Realm AVPs, two
+  AVPs that don't belong in a CCR at all (Accounting-Record-Type/Number,
+  Vendor-Specific-Application-Id), a missing mandatory Auth-Application-Id,
+  and a subscriber-identity format (`sip:` URI vs `tel:` URI) OCS's own lookup
+  didn't recognize. All five are now real unified-diff source patches baked
+  into the module's build pipeline — the same `apt-get source` → `patch` →
+  build → ABI-verify → deploy pipeline already used for this project's other
+  patched Kamailio modules — not just hand-patched on one host.
+
+### Current Status
+
+Beta. Gy (data charging) end-to-end confirmed live. Ro (voice/airtime
+charging) end-to-end confirmed live with a real completed call. 4G/EPC only —
+explicitly, permanently out of scope for 5G NR, since Open5GS's SMF has no 5G
+online-charging client to wire up at all.
+
+---
+
+## Charging Plans
+
+> **Beta**, voice half confirmed working end-to-end. A deliberately simplified
+> GUI layer over SigScale OCS's own full rating-plan vocabulary, built after
+> explicit user feedback that the SigScale GUI itself was too complex for
+> day-to-day plan management. Requires SigScale OCS installed and configured
+> first; the voice-cap half additionally depends on the Ro toggle above.
+
+### What It Does
+
+One GUI "Plan" — a name, a data cap in GB, a voice cap in minutes — maps to
+one OCS bundle offer, referencing a data sub-offer and a voice sub-offer under
+the hood. Plans are managed in their own Mongo collection, mirroring this
+project's existing Subscriber Groups CRUD/assignment shape. Subscribers can be
+assigned to a plan two ways: a bulk-select toolbar action on the Subscribers
+page, or a per-row "Set plan" control in the Plan column (added after the
+bulk-only flow proved hard to discover in practice).
+
+An "Unlimited" plan is auto-provisioned on every OCS Configure — not a
+dedicated no-cap code path, but a deliberately huge finite cap (1,000,000 GB /
+1,000,000 minutes), specifically to avoid exercising an untested interaction
+with the still-open rating-engine bug described below. Any cap at or above
+100,000 (GB or minutes) renders as "Unlimited" in the UI rather than the raw
+number.
+
+### Components
+
+- **Backend**: `charging-plans-controller.ts` — plan CRUD, subscriber
+  assignment, the default-Unlimited-plan provisioning.
+- **Backend**: `ocs-reservation-guard.ts` — the mitigation for the rating-
+  engine bug below.
+- **Frontend**: `ChargingPlansPage.tsx`.
+
+### Real bugs found and fixed getting this working end-to-end
+
+- **A subscriber's data and voice usage could silently draw from two
+  unrelated pools.** Found while chasing a usage readout stuck at 0 despite a
+  confirmed real charge having happened: the assignment code linked a
+  subscriber's IMSI and MSISDN to OCS *separately* — Gy (data) keys off IMSI,
+  Ro (voice) keys off MSISDN, so linking them independently landed the same
+  subscriber on two disconnected OCS products with two disconnected buckets.
+  Fixed to link every identity for one subscriber to a single shared product,
+  atomically (a second, related bug in the fix's own "already linked"
+  short-circuit was also found and fixed).
+- **A real, still-unresolved bug lives inside OCS's own rating engine**
+  (`ocs_rating:charge2`, a `function_clause` crash specifically on session
+  termination) that periodically leaks stuck Gy/Ro reservations across
+  multiple subscribers. This is **not fixed** — no exact-version source is
+  obtainable for the installed OCS release, and the compiled `.beam` has
+  neither debug info nor an exported `charge2` function to probe directly.
+  What exists instead is a mitigation: `OcsReservationGuard` runs
+  continuously in the background (on by default), sweeps every 30 minutes,
+  and clears any reservation entry older than 2 hours via a
+  balance-preserving write that never touches the actual remaining balance.
+  It keeps the symptom from requiring manual intervention; it does not fix
+  the underlying engine bug. Filing this as an upstream SigScale issue is the
+  recommended next step, not yet done as of this writing.
+
+### Current Status
+
+Beta. Voice-cap half confirmed working end-to-end. The reservation-leak
+mitigation is running and effective as a workaround, but the root cause in
+OCS's own rating engine remains genuinely unresolved — don't represent this
+charging path as fully hardened without that caveat.
+
+---
+
+## Call History (CDR)
+
+> **Beta.** Unified call detail records across PSTN, 2G, and 4G/5G IMS calls,
+> built in three independently-risk-staged phases. Phase 1 is stable and
+> verified against a real dataset; Phase 2's code is deployed but not yet
+> confirmed against a real end-to-end test call; Phase 3 is confirmed working
+> against multiple real test calls.
+
+### What It Does
+
+Rather than introduce a new primary datastore, this feature syncs call
+records from each existing system's own real source of truth into one shared
+`nms_cdr` Mongo collection (retention-configurable, defaulting to a 180-day
+TTL):
+
+- **Phase 1 — PSTN Gateway.** Tails Asterisk's own CSV CDR output. Stable,
+  verified against a real 76+-row dataset.
+- **Phase 2 — Asterisk-2G.** Same CSV-tailing approach, applied to the
+  second, isolated Asterisk instance the 2G module owns. A real bug was found
+  and fixed here: the controller never created the `cdr-csv/` subdirectory
+  Asterisk's own `cdr_csv` module needs to write into, so it silently
+  recorded nothing at all. The fix is deployed, but a real end-to-end test
+  call confirming it actually writes records now has not yet been done.
+- **Phase 3 — direct 4G/5G IMS-to-IMS calls.** The one call path with no
+  B2BUA CDR of its own to tail, so this uses Kamailio's own `acc` module
+  instead — basic flag-based accounting, deliberately not `acc`'s newer
+  `cdr_enable` mode (which depends on a `dialog` module this deployment
+  doesn't load). Gated behind both a compile-time build flag and an
+  independent runtime toggle ("Direct IMS Call Recording" on the Call
+  History page's own Settings panel).
+
+### Components
+
+- **Backend**: `cdr-store.ts`, `cdr-sync-monitor.ts`, `cdr-controller.ts`.
+- **Frontend**: `CallHistoryPage.tsx`.
+
+### Real bugs found and fixed getting this working end-to-end
+
+- **Phase 2's missing `cdr-csv/` directory**, described above — silent
+  data loss with no error surfaced anywhere.
+- **A static IMS Kamailio template only reaches the live host through a full
+  IMS Install/Configure — a lightweight toggle setter like the one this
+  feature uses does not redeploy it.** Wiring Phase 3 exposed this directly:
+  the live host's Kamailio config copy was a full day stale, missing both an
+  unrelated same-day fix and this feature's own new `WITH_CDR` blocks.
+  Flipping the runtime toggle restarted the Kamailio service and reported
+  success, but the actually-running config still had no `acc` module loaded
+  at all — only the small generated include file had been rewritten, not the
+  static template it's included from. If a static IMS template is edited and
+  needs to go live without a full re-Configure, it has to be redeployed to
+  its real host path manually first.
+
+### Current Status
+
+Phase 1 (PSTN): stable, live-verified. Phase 3 (direct IMS): confirmed fully
+working end-to-end against 3 real test calls, including a call that fell to
+voicemail and a PSTN-Gateway-routed call correctly captured as its real two
+separate B2BUA-split dialogs. Phase 2 (Asterisk-2G): code deployed, real
+end-to-end confirmation still outstanding — don't represent this phase as
+verified until that happens. `missed_calls` (busy/rejected call) tracking is
+implemented per Kamailio's documented, stable module behavior, but has not
+yet been empirically verified against a real busy call. Note: a voicemail
+pickup is indistinguishable from a normal human answer at the SIP/`acc`
+level (both are ordinary 2xx-terminated INVITE transactions) — this is
+documented behavior in the UI's own info banner, not a bug.
+
+---
+
+## Traffic History
+
+### What It Does
+
+Shows aggregate and per-subscriber network traffic history (throughput
+over time). Deliberately **does not maintain its own time-series
+store** — this project already runs a Prometheus + Grafana monitoring
+stack for every core network function's own metrics, so Traffic History
+is built as a consumer of that existing time-series database rather than
+a second one.
+
+An earlier version of this feature *did* build its own MongoDB-backed
+time-series store for this data. It was replaced once it became clear
+Prometheus was already deployed and already doing exactly this job — a
+real design correction, not a bug fix, and a useful precedent for any
+future feature that might be tempted to stand up its own metrics
+storage.
+
+Per-subscriber byte counters are collected by a dedicated nftables
+accounting table (`subscriber-ip-accounting.ts`) — one counter rule pair
+(upload/download) per subscriber UE IP, in its own `inet
+open5gs_nms_acct` table so it never collides with any other nftables-based
+feature in this project. Those counters, plus each core NF's own GTP
+counters, are exposed via a `/metrics` endpoint
+(`prometheus-metrics.ts`) that the existing Prometheus instance scrapes
+like any other target. The frontend's filter parameters are translated
+directly into a PromQL `query_range` call, and Prometheus's own `rate()`
+computes throughput (Mbps) — no rate/delta math is duplicated on this
+project's own side.
+
+### Components
+
+- **Backend**: `subscriber-ip-accounting.ts` (nftables byte counters),
+  `prometheus-metrics.ts` (the `/metrics` endpoint Prometheus scrapes),
+  `traffic-history-controller.ts` (thin PromQL `query_range` proxy).
+- **Frontend**: `TrafficHistoryPage.tsx`.
+- **Prometheus** (already-deployed monitoring stack, shared with every
+  core NF's own metrics) is the actual time-series store — not a new one.
+
+### Design Notes
+
+Retention is whatever Prometheus's own `--storage.tsdb.retention.time` is
+configured to — shared with every other NF's metrics, not independently
+configurable per this feature. If a UE's IP gets reassigned to a
+different subscriber, the accounting layer deletes and recreates that
+IP's counter rule pair (rather than relabeling it in place), so the
+counter resets to zero instead of the new subscriber silently inheriting
+the previous owner's byte count.
+
+### Current Status
+
+Stable.
+
+---
+
+## UE Signal Monitoring
+
+> **Community-contributed** (PR #32). **Baicells-native connector only**
+> at this time — other radio vendors need a generic JSON connector, which
+> requires the radio to already expose its own metrics in that shape, so
+> this is not a drop-in solution for every vendor.
+
+### What It Does
+
+Per-UE radio signal and link-quality monitoring — RSRP, RSRQ, SINR, BLER,
+MCS, CQI, and throughput — correlated with subscriber identity (IMSI,
+ICCID, MSISDN) rather than shown as anonymous radio-side numbers. Keeps
+7 days of history in a local SQLite database. Radio management
+credentials used to pull this data are stored AES-256-GCM encrypted, not
+in plaintext. Includes an admin-triggered downlink "wake" action to
+prompt an idle UE to respond so its current signal state can be read.
+
+### Components
+
+- **Backend**: `radio-signal-controller.ts`.
+- **Frontend**: `RadioSignalPage.tsx`.
+
+### Design Notes
+
+`ENABLE_UE_SIGNAL_MODULE` defaults **enabled** (set to `false` to hide
+it) — unlike most other opt-in modules in this project, this is a pure
+visibility gate, not an install/uninstall lifecycle; there's no separate
+"module" to install or uninstall on the host.
+
+The Baicells-native connector reads the radio's own vendor-specific
+metrics API directly. Other vendors are not currently supported the same
+way — a generic JSON connector exists as the fallback path, but it only
+works if that radio already exposes its own metrics in a compatible
+shape, so it isn't a universal drop-in.
+
+### Current Status
+
+Stable for Baicells radios via the native connector. Other vendors depend
+on the generic JSON connector already being viable for that specific
+radio's own metrics format.
 
 ---
 

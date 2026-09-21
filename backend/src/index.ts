@@ -63,6 +63,10 @@ import { GetInterfaceStatus } from './application/use-cases/interface-status/get
 import { GtpBandwidthMonitor } from './application/use-cases/interface-status/gtp-bandwidth';
 import { ImsCallStatsMonitor } from './application/use-cases/ims/call-stats-monitor';
 import { IpsecSaCleanup } from './application/use-cases/ims/ipsec-sa-cleanup';
+import { CdrSyncMonitor } from './application/use-cases/cdr/cdr-sync-monitor';
+import { OcsReservationGuard } from './application/use-cases/ocs/ocs-reservation-guard';
+import { ensureCdrIndexes } from './application/use-cases/cdr/cdr-store';
+import { createCdrRouter, readCdrSettings } from './interfaces/rest/cdr-controller';
 import { ActiveSessionsUseCase } from './application/use-cases/active-sessions';
 import { SuciManagementUseCase } from './application/use-cases/suci-management';
 import { SyncSDUseCase } from './application/use-cases/sync-sd-usecase';
@@ -80,6 +84,9 @@ import { createRadioBlockRouter } from './interfaces/rest/radio-block-controller
 import { SqliteGnbBlockRepository } from './infrastructure/auth/sqlite-gnb-block-repository';
 import { GnbBlockService } from './application/use-cases/ran/gnb-block-service';
 import { createGnbBlockRouter } from './interfaces/rest/gnb-block-controller';
+import { SqliteHnbBlockRepository } from './infrastructure/auth/sqlite-hnb-block-repository';
+import { HnbBlockService } from './application/use-cases/ran/hnb-block-service';
+import { createHnbBlockRouter } from './interfaces/rest/hnb-block-controller';
 import { createQciHwTestRouter } from './interfaces/rest/qci-hw-test-controller';
 import { SqliteUeBlockRepository } from './infrastructure/auth/sqlite-ue-block-repository';
 import { UeBlockService } from './application/use-cases/ran/ue-block-service';
@@ -89,6 +96,8 @@ import { createGenieacsRouter } from './interfaces/rest/genieacs-controller';
 import { createChronyRouter } from './interfaces/rest/chrony-controller';
 import { createSyslogRouter } from './interfaces/rest/syslog-controller';
 import { createSpeedtestRouter } from './interfaces/rest/speedtest-controller';
+import { createIpPlanRouter } from './interfaces/rest/ip-plan-controller';
+import { IpPlanApplyUseCase } from './application/use-cases/ip-plan-apply-usecase';
 import { createFrrRouter } from './interfaces/rest/frr-controller';
 import { createFrrSourceBuildRouter } from './interfaces/rest/frr-source-build-controller';
 import { createSmsRouter } from './interfaces/rest/sms-controller';
@@ -101,7 +110,9 @@ import { createSecgwRouter } from './interfaces/rest/secgw-controller';
 import { createSwuEmulatorRouter } from './interfaces/rest/swu-emulator-controller';
 import { createPstnRouter } from './interfaces/rest/pstn-controller';
 import { createAsterisk2gRouter } from './interfaces/rest/asterisk-2g-controller';
-import { createHnbgwRouter } from './interfaces/rest/hnbgw-controller';
+import { createHnbgwRouter, loadHnbgwState } from './interfaces/rest/hnbgw-controller';
+import { createOcsRouter } from './interfaces/rest/ocs-controller';
+import { createChargingPlansRouter } from './interfaces/rest/charging-plans-controller';
 import { createBindRouter } from './interfaces/rest/bind-controller';
 import { createValidationRouter } from './interfaces/rest/validation-controller';
 import { createVolteValidationRouter } from './interfaces/rest/volte-validation-controller';
@@ -208,6 +219,26 @@ async function main() {
   const ipsecSaCleanup = new IpsecSaCleanup(hostExecutor, logger);
   ipsecSaCleanup.start();
 
+  // ── CDR sync ──
+  // Background poller tailing Asterisk's own CDR CSVs (PSTN Gateway today;
+  // Asterisk-2G once its own missing cdr-csv directory is fixed) into
+  // nms_cdr — see cdr-sync-monitor.ts header. Index/retention setup runs
+  // once at startup using whatever retention the operator last configured
+  // (defaults to DEFAULT_CDR_RETENTION_DAYS on a fresh deployment).
+  const cdrSyncMonitor = new CdrSyncMonitor(subscriberRepo.getDb(), subscriberRepo, logger);
+  ensureCdrIndexes(subscriberRepo.getDb(), readCdrSettings().retentionDays)
+    .catch(err => logger.warn({ err: String(err) }, 'CDR: failed to ensure indexes at startup'));
+  cdrSyncMonitor.start();
+
+  // Periodically clears stuck Gy/Ro reservations leaked by a real,
+  // still-unresolved OCS rating-engine crash (ocs_rating:charge2 on session
+  // termination) — see ocs-reservation-guard.ts header and memory
+  // sigscale_ocs_module_progress.md. On by default (explicit user request,
+  // not gated behind a settings toggle) — a no-op on any deployment that
+  // hasn't configured OCS.
+  const ocsReservationGuard = new OcsReservationGuard(logger, auditLogger);
+  ocsReservationGuard.start();
+
   // ── SAS service ──
   // Create a child logger tagged with module:'sas' so the log stream can filter SAS-only messages
   const sasLogger = logger.child({ module: 'sas' });
@@ -234,6 +265,9 @@ async function main() {
   const gnbBlockRepo = new SqliteGnbBlockRepository(authRepo.getDb());
   const gnbBlockService = new GnbBlockService(hostExecutor, gnbBlockRepo, logger);
   gnbBlockService.start();
+  const hnbBlockRepo = new SqliteHnbBlockRepository(authRepo.getDb());
+  const hnbBlockService = new HnbBlockService(hostExecutor, hnbBlockRepo, logger, () => loadHnbgwState().iuhLocalPort);
+  hnbBlockService.start();
 
   // Ensure backup directories exist
   try {
@@ -371,6 +405,15 @@ async function main() {
     logger,
     config.backupPath,
   );
+  const ipPlanApplyUseCase = new IpPlanApplyUseCase(
+    configRepo,
+    autoConfigUseCase,
+    subscriberRepo,
+    hostExecutor,
+    config.mongodbUri,
+    logger,
+    auditLogger,
+  );
   const logStreamingUseCase = new LogStreamingUseCase(hostExecutor, logger);
   const dockerLogExecutor = new DockerLogExecutor(logger);
   const dockerLogStreamingUseCase = new DockerLogStreamingUseCase(dockerLogExecutor, logger);
@@ -491,6 +534,7 @@ async function main() {
   const getInterfaceStatusForBlock = new GetInterfaceStatus(hostExecutor, logger, activeSessionsUseCase, configRepo, baicellsUeCounts);
   app.use('/api/radio-block', createRadioBlockRouter(radioBlockService, getInterfaceStatusForBlock, auditLogger, logger));
   app.use('/api/gnb-block', createGnbBlockRouter(gnbBlockService, getInterfaceStatusForBlock, auditLogger, logger));
+  app.use('/api/hnb-block', createHnbBlockRouter(hnbBlockService, auditLogger, logger));
   const ueBlockRepo = new SqliteUeBlockRepository(authRepo.getDb());
   const ueBlockService = new UeBlockService(hostExecutor, ueBlockRepo, getInterfaceStatusForBlock, logger);
   ueBlockService.start();
@@ -501,6 +545,7 @@ async function main() {
   app.use('/api/chrony',   createChronyRouter(logger, auditLogger));
   app.use('/api/syslog',   createSyslogRouter(logger, auditLogger));
   app.use('/api/speedtest', createSpeedtestRouter(logger, auditLogger));
+  app.use('/api/ip-plan',  createIpPlanRouter(logger, auditLogger, configRepo, ipPlanApplyUseCase));
   app.use('/api/frr/source-build', createFrrSourceBuildRouter(logger, auditLogger));
   app.use('/api/frr',      createFrrRouter(logger, auditLogger));
   app.use('/api/sms',        createSmsRouter(subscriberRepo, logger, auditLogger));
@@ -510,9 +555,12 @@ async function main() {
   app.use('/api/ims',        createImsRouter(subscriberRepo, logger, auditLogger, imsCallStatsMonitor));
   app.use('/api/vowifi',     createVowifiRouter(logger, auditLogger));
   app.use('/api/secgw',      createSecgwRouter(logger, auditLogger));
-  app.use('/api/pstn',       createPstnRouter(subscriberRepo, config.mongodbUri, logger, auditLogger));
+  app.use('/api/pstn',       createPstnRouter(subscriberRepo, config.mongodbUri, logger, auditLogger, hostExecutor));
   app.use('/api/asterisk-2g', createAsterisk2gRouter(subscriberRepo, config.mongodbUri, logger, auditLogger));
   app.use('/api/hnbgw',      createHnbgwRouter(logger, auditLogger));
+  app.use('/api/ocs',        createOcsRouter(subscriberRepo, subscriberRepo.getDb(), logger, auditLogger));
+  app.use('/api/charging-plans', createChargingPlansRouter(subscriberRepo, subscriberRepo.getDb(), logger, auditLogger));
+  app.use('/api/cdr',        createCdrRouter(subscriberRepo.getDb(), logger, auditLogger, cdrSyncMonitor));
   app.use('/api/swu-emulator', createSwuEmulatorRouter(subscriberRepo, logger, auditLogger));
   app.use('/api/bind', createBindRouter(logger, auditLogger));
   app.use('/api/validation/volte', createVolteValidationRouter(logger, auditLogger));
@@ -661,8 +709,11 @@ async function main() {
     subscriberIpAccounting.stop();
     radioBlockService.stop();
     gnbBlockService.stop();
+    hnbBlockService.stop();
     ueBlockService.stop();
     mmsMsisdnMapRefresher.stop();
+    cdrSyncMonitor.stop();
+    ocsReservationGuard.stop();
     await imsTestNumberManager.stopAll();
     await subscriberRepo.disconnect();
     await rfPlanningProjectRepo.disconnect();

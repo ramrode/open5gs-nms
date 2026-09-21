@@ -11,6 +11,7 @@ import {
   type GsmStatus, type BtsEntry, type BtsBackend, type GsmConfigFile, type DiscoveredRadio, type BtsLinkStatus,
 } from '../api/gsm';
 import { asterisk2gApi, type Asterisk2gStatus } from '../api/asterisk-2g';
+import { ipPlanApi } from '../api/ip-plan';
 import { FEATURES } from '../config/features';
 import { SubscriberAuthTab } from './SubscriberAuthTab';
 
@@ -138,6 +139,23 @@ function SetupTab({ status, refresh, onNavigate }: { status: GsmStatus | null; r
     setGgsnDns1(status.ggsnDns1 || '1.1.1.1');
     setGgsnDns2(status.ggsnDns2 || '9.9.9.9');
     setGprsNat(!!status.gprsNat);
+    // Pre-fill real-network-facing fields from the Auto-Config page's Static
+    // IP Plan when this module has never been configured here yet —
+    // bscMgwBindIp's own hardcoded '127.0.0.1' default is non-functional for
+    // a real nanoBTS (see gsm-bsc-mgw's catalog note), and sgsnGbRemoteIp
+    // already has its own auto-derive fallback (deriveSgsnGbIp() server-side)
+    // that an explicit plan value should take priority over. Same smart-
+    // default pattern as SecGWPage/VoWiFiPage/PstnGatewayPage's
+    // ExternalTrunkCard; gated on status.configured (not the IP values)
+    // since bscMgwBindIp always has SOME non-empty default from the backend
+    // even when never configured.
+    if (!status.configured) {
+      ipPlanApi.list().then(({ entries }) => {
+        const plan = Object.fromEntries(entries.filter(e => e.planned).map(e => [e.service, e.planned as string]));
+        if (plan['gsm-bsc-mgw']) setBscMgwBindIp(plan['gsm-bsc-mgw']);
+        if (plan['gsm-sgsn-gb']) setSgsnGbRemoteIp(plan['gsm-sgsn-gb']);
+      }).catch(() => {});
+    }
   }, [status]);
 
   // One single action does everything — install (idempotent: a no-op apt-get
@@ -1264,7 +1282,7 @@ function Asterisk2gTab() {
 
       {!status.installed && (
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg p-3 text-xs text-amber-300">
-          Not installed yet — this shares the same apt Asterisk package the PSTN Gateway uses (if already installed there,
+          Not installed yet — this shares the same apt Asterisk package the Voice Gateway uses (if already installed there,
           this step is a fast no-op) but builds its own separate, isolated instance on top of it.
         </div>
       )}

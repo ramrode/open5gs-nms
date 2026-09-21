@@ -507,7 +507,7 @@ export const BackupPage: React.FC = () => {
           Download a single <code className="text-nms-accent">.tar.gz</code> archive containing subscribers &amp; SAS data,
           all Open5GS core NF configs, SUCI keys, optional module configs, L3/FRR routing, and DNS/BIND — everything needed
           to fully restore the system from scratch, even if the project folder and backups directory are gone. (IMS and
-          PSTN Gateway are intentionally excluded — reinstall those modules and resync subscribers instead.) Restoring
+          the Voice Gateway are intentionally excluded — reinstall those modules and resync subscribers instead.) Restoring
           lets you pick exactly which of these to bring back.
         </p>
 

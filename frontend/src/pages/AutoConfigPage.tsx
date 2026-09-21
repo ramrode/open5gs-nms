@@ -1,15 +1,17 @@
 import { useState, useEffect } from 'react';
-import { Settings, Zap, AlertCircle, FileText, List, Globe } from 'lucide-react';
+import { Settings, Zap, AlertCircle, FileText, List, Globe, Network } from 'lucide-react';
 import { autoConfigApi, AutoConfigInput, PlmnConfig, configApi } from '../api';
 import { DiffViewer } from '../components/DiffViewer';
 import { PlmnInput } from '../components/config/PlmnInput';
 import { LabelWithTooltip } from '../components/common/UniversalTooltipWrappers';
 import { AUTO_CONFIG_TOOLTIPS } from '../data/tooltips';
 import { PlmnMigrationTab } from '../components/autoconfig/PlmnMigrationTab';
+import { IpPlanTab } from '../components/autoconfig/IpPlanTab';
+import { ipPlanApi } from '../api/ip-plan';
 import toast from 'react-hot-toast';
 import { clsx } from 'clsx';
 
-type Tab = 'open5gs' | 'plmn-migration';
+type Tab = 'open5gs' | 'ip-plan' | 'plmn-migration';
 
 export const AutoConfigPage: React.FC = () => {
   const [activeTab, setActiveTab] = useState<Tab>('open5gs');
@@ -49,6 +51,28 @@ export const AutoConfigPage: React.FC = () => {
   const [previewData, setPreviewData] = useState<string[] | null>(null);
   const [previewDiffs, setPreviewDiffs] = useState<Record<string, string> | null>(null);
   const [viewMode, setViewMode] = useState<'summary' | 'yaml'>('summary');
+
+  // Pre-fill any of these 6 fields that are STILL blank after the live-NF-
+  // config load above (i.e. never configured) from the Static IP Plan tab —
+  // same smart-default pattern as SecGWPage/VoWiFiPage/PstnGatewayPage/
+  // GsmPage; never overwrites a real value already derived from the live
+  // config. Runs once the primary load settles, not before (avoids racing
+  // setConfig calls).
+  useEffect(() => {
+    if (initializing) return;
+    ipPlanApi.list().then(({ entries }) => {
+      const plan = Object.fromEntries(entries.filter(e => e.planned).map(e => [e.service, e.planned as string]));
+      setConfig(c => ({
+        ...c,
+        s1mmeIP: c.s1mmeIP || plan['mme-s1mme'] || c.s1mmeIP,
+        sgwuGtpIP: c.sgwuGtpIP || plan['sgwu-s1u'] || c.sgwuGtpIP,
+        amfNgapIP: c.amfNgapIP || plan['amf-ngap'] || c.amfNgapIP,
+        upfGtpIP: c.upfGtpIP || plan['upf-n3'] || c.upfGtpIP,
+        smfPfcpIP: c.smfPfcpIP || plan['smf-pfcp'] || c.smfPfcpIP,
+        localUpfPfcpIP: c.localUpfPfcpIP || plan['local-upf-pfcp'] || c.localUpfPfcpIP,
+      }));
+    }).catch(() => {});
+  }, [initializing]);
 
   useEffect(() => {
     const loadCurrentConfigs = async () => {
@@ -235,6 +259,7 @@ export const AutoConfigPage: React.FC = () => {
 
   const TABS: { id: Tab; label: string; icon: React.ReactNode }[] = [
     { id: 'open5gs',        label: 'Open5GS Auto Config', icon: <Settings className="w-4 h-4" /> },
+    { id: 'ip-plan',        label: 'Static IP Plan',      icon: <Network className="w-4 h-4" /> },
     { id: 'plmn-migration', label: 'PLMN Migration',      icon: <Globe className="w-4 h-4" /> },
   ];
 
@@ -578,6 +603,8 @@ export const AutoConfigPage: React.FC = () => {
       )}
 
       {/* Tab: PLMN Migration Wizard */}
+      {activeTab === 'ip-plan' && <IpPlanTab />}
+
       {activeTab === 'plmn-migration' && <PlmnMigrationTab />}
     </div>
   );

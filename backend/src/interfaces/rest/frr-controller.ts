@@ -8,6 +8,7 @@ import pino from 'pino';
 import { IAuditLogger } from '../../domain/interfaces/audit-logger';
 import { requireAdmin } from './middleware/auth-middleware';
 import { nsenter, createDummyInterface, deleteDummyInterface, dummyNetdevPath } from '../../infrastructure/network/dummy-interface';
+import { listHostInterfaces } from '../../infrastructure/network/main-interface';
 import {
   ensureDaemonLine, parseEigrpNeighbors, buildFrrSourceScript, restoreFrrFromSnapshot,
   verifyFrr, DEFAULT_FRR_TAG,
@@ -557,23 +558,13 @@ export function createFrrRouter(logger: pino.Logger, auditLogger: IAuditLogger):
     }
   });
 
+  // Moved to infrastructure/network/main-interface.ts's listHostInterfaces()
+  // (same "which interface owns the default route" logic, now shared with
+  // the IP Plan feature) — this handler is now a thin wrapper.
   router.get('/interfaces', async (_req: Request, res: Response) => {
     try {
-      const { stdout } = await nsenter('ip', ['-j', 'addr', 'show']);
-      const ifaces: any[] = JSON.parse(stdout);
-      const { stdout: routeOut } = await nsenter('ip', ['-j', 'route', 'show', 'default']).catch(() => ({ stdout: '[]' }));
-      const defaultRoutes: any[] = JSON.parse(routeOut);
-      const mgmtIface = defaultRoutes[0]?.dev ?? null;
-      const result = ifaces
-        .filter(i => !i.ifname?.startsWith('lo') && !i.ifname?.startsWith('docker') && !i.ifname?.startsWith('br-'))
-        .map(i => ({
-          name: i.ifname,
-          mac: i.address,
-          state: i.operstate,
-          addresses: (i.addr_info ?? []).filter((a: any) => a.family === 'inet').map((a: any) => `${a.local}/${a.prefixlen}`),
-          isMgmt: i.ifname === mgmtIface,
-        }));
-      res.json({ success: true, interfaces: result, mgmtInterface: mgmtIface });
+      const { interfaces, mgmtInterface } = await listHostInterfaces();
+      res.json({ success: true, interfaces, mgmtInterface });
     } catch (err) {
       res.status(500).json({ success: false, error: String(err) });
     }

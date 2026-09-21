@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { stringify as stringifyYaml } from 'yaml';
 import { Copy, Check, KeyRound, Loader2, Download } from 'lucide-react';
 import toast from 'react-hot-toast';
@@ -8,6 +8,7 @@ import { LabelWithTooltip } from '../../common/UniversalTooltipWrappers';
 import { COMMON_TOOLTIPS } from '../../../data/tooltips';
 import { seppApi } from '../../../api/sepp';
 import { useCopyToClipboard } from '../../../hooks/useCopyToClipboard';
+import { ipPlanApi } from '../../../api/ip-plan';
 
 interface Props {
   configs: AllConfigs;
@@ -52,6 +53,48 @@ export function SeppEditor({ configs, onChange }: Props): JSX.Element {
     seppApi.getCert().then(r => { if (r.exists && r.cert) setExistingCert(r.cert); }).catch(() => {});
     seppApi.getPeerCert().then(r => { if (r.exists && r.cert) setPeerCertInput(r.cert); }).catch(() => {});
   }, []);
+
+  // Pre-fill SBI/N32-c/N32-f from the Auto-Config page's Static IP Plan the
+  // first time real config data arrives, but ONLY while every one of these
+  // fields is still at its as-shipped loopback default (127.1.250/.251/.252
+  // — see sepp1.yaml) — i.e. never customized. Read-only pre-fill (no
+  // write-back hook here, unlike the other wired pages): this editor has no
+  // dedicated Configure action of its own to hook into, only the shared
+  // ConfigPage-wide Apply flow every core-17 NF editor uses — the operator's
+  // own Apply already persists whatever ends up in these fields.
+  const seppPlanSeeded = useRef(false);
+  useEffect(() => {
+    if (seppPlanSeeded.current) return;
+    const s = sepp?.sbi?.server?.[0];
+    const n32 = sepp?.n32?.server?.[0];
+    if (!s) return; // real data hasn't loaded yet — wait for a re-render with it
+    seppPlanSeeded.current = true;
+    const stillDefault = s.address === '127.0.1.250' && (!n32?.address || n32.address === '127.0.1.251') && (!n32?.n32f?.address || n32.n32f.address === '127.0.1.252');
+    if (!stillDefault) return;
+    ipPlanApi.list().then(({ entries }) => {
+      const plan = Object.fromEntries(entries.filter(e => e.planned).map(e => [e.service, e.planned as string]));
+      if (!plan['sepp-sbi'] && !plan['sepp-n32c'] && !plan['sepp-n32f']) return;
+      onChange({
+        ...configs,
+        sepp1: {
+          ...fullYaml,
+          sepp: {
+            ...sepp,
+            sbi: { ...sepp.sbi, server: [{ ...s, address: plan['sepp-sbi'] || s.address }] },
+            n32: {
+              ...sepp.n32,
+              server: [{
+                ...n32,
+                address: plan['sepp-n32c'] || n32?.address,
+                n32f: { ...n32?.n32f, address: plan['sepp-n32f'] || n32?.n32f?.address },
+              }],
+            },
+          },
+        },
+      });
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sepp]);
 
   if (!sepp?.sbi?.server || sepp.sbi.server.length === 0) {
     return <div className="text-nms-text-dim">Loading SEPP configuration...</div>;

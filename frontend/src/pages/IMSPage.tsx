@@ -10,6 +10,7 @@ import {
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import { imsApi, ImsConfigureInput } from '../api/ims';
+import { ipPlanApi } from '../api/ip-plan';
 import type { ImsStatus, ValidationCheck, ImsConfigFile, ImsLiveStatus, RegisteredUserInfo } from '../api/ims';
 
 // ── Shared sub-components ─────────────────────────────────────────────────────
@@ -182,6 +183,19 @@ function ConfigureCard({ status, onDone }: {
     if (cfgSeeded.current) return;
     if (status.currentConfig) {
       setCfg({ additionalPlmns: [], mcc: '', mnc: '', ...(status.currentConfig as ImsConfigureInput) });
+    } else {
+      // Never configured yet — pre-fill P-CSCF/RTPengine from the Auto-
+      // Config page's Static IP Plan instead of silently keeping this
+      // component's own hardcoded placeholder defaults. Same smart-default
+      // pattern as SecGWPage/VoWiFiPage/PstnGatewayPage/GsmPage.
+      ipPlanApi.list().then(({ entries }) => {
+        const plan = Object.fromEntries(entries.filter(e => e.planned).map(e => [e.service, e.planned as string]));
+        setCfg(c => ({
+          ...c,
+          pcscfIp: plan['ims-pcscf'] || c.pcscfIp,
+          rtpEngineIp: plan['ims-rtpengine'] || plan['ims-pcscf'] || c.rtpEngineIp,
+        }));
+      }).catch(() => {});
     }
     cfgSeeded.current = true;
   }, [status]);

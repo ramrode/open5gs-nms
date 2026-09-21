@@ -115,6 +115,22 @@ export const gnbBlockApi = {
     api.post<{ success: boolean; ips: string[] }>('/gnb-block/all').then(r => r.data),
 };
 
+// Blocks an HNB's Iuh (SCTP) path to HNBGW via nftables, without touching the
+// radio itself — the 3G equivalent of radioBlockApi/gnbBlockApi. Only one
+// port (not two like S1-MME+S1-U or N2+N3) since a 3G HNB's only path to
+// this host is the single Iuh association — see hnb-block-service.ts.
+export interface HnbBlockInfo { ip: string; blockedBy: string; blockedAt: number }
+export const hnbBlockApi = {
+  getAll: () =>
+    api.get<HnbBlockInfo[]>('/hnb-block').then(r => r.data),
+  block: (ip: string) =>
+    api.post(`/hnb-block/${encodeURIComponent(ip)}`).then(r => r.data),
+  unblock: (ip: string) =>
+    api.delete(`/hnb-block/${encodeURIComponent(ip)}`).then(r => r.data),
+  blockAll: () =>
+    api.post<{ success: boolean; ips: string[] }>('/hnb-block/all').then(r => r.data),
+};
+
 export const tunApi = {
   list: () =>
     api.get<{ interfaces: TunInterface[]; networkdActive: boolean; nextName: string }>('/tun-interfaces').then(r => r.data),
@@ -196,6 +212,86 @@ export const subscriberGroupsApi = {
     api.put(`/subscriber-groups/${id}`, patch).then(r => r.data),
   delete: (id: string) =>
     api.delete(`/subscriber-groups/${id}`).then(r => r.data),
+};
+
+// ── Charging Plans (simple data + voice caps, backed by SigScale OCS) ──
+export interface ChargingPlan {
+  _id: string;
+  name: string;
+  dataCapGB: number;
+  voiceCapMinutes: number;
+  ocsBundleOfferId: string;
+  ocsDataOfferId: string;
+  ocsVoiceOfferId: string;
+  imsis: string[];
+  createdAt: number;
+}
+export interface SubscriberUsage {
+  dataUsedBytes: number; dataTotalBytes: number;
+  voiceUsedSeconds: number; voiceTotalSeconds: number;
+}
+
+export const chargingPlansApi = {
+  list: () =>
+    api.get<{ success: boolean; data: ChargingPlan[] }>('/charging-plans').then(r => r.data.data),
+  create: (name: string, dataCapGB: number, voiceCapMinutes: number) =>
+    api.post<{ success: boolean; data: ChargingPlan; error?: string }>('/charging-plans', { name, dataCapGB, voiceCapMinutes }).then(r => r.data),
+  update: (id: string, patch: { name?: string; dataCapGB?: number; voiceCapMinutes?: number }) =>
+    api.put<{ success: boolean; error?: string }>(`/charging-plans/${id}`, patch).then(r => r.data),
+  delete: (id: string) =>
+    api.delete<{ success: boolean; error?: string }>(`/charging-plans/${id}`).then(r => r.data),
+  assign: (id: string, imsis: string[]) =>
+    api.post<{ success: boolean; assigned?: number; failed?: number; error?: string }>(`/charging-plans/${id}/assign`, { imsis }).then(r => r.data),
+  usage: (id: string) =>
+    api.get<{ success: boolean; data: Record<string, SubscriberUsage | null> }>(`/charging-plans/${id}/usage`).then(r => r.data.data),
+};
+
+// ── Call Detail Records ──
+export interface CdrParty {
+  raw: string;
+  imsi?: string;
+  msisdn?: string;
+  nickname?: string;
+}
+export interface CdrRecord {
+  _id: string;
+  sourceSystem: 'pstn' | '2g' | 'ims';
+  sourceInstance: 'pstn' | 'asterisk2g' | 'scscf';
+  sourceRecordId: string;
+  caller: CdrParty;
+  callee: CdrParty;
+  startTime: string;
+  answerTime: string | null;
+  endTime: string | null;
+  durationSeconds: number | null;
+  totalDurationSeconds: number | null;
+  disposition: 'answered' | 'no-answer' | 'busy' | 'failed' | 'cancelled' | 'unknown';
+  rawDisposition: string;
+  raw: Record<string, unknown>;
+  syncedAt: string;
+}
+export interface CdrListResponse {
+  success: boolean;
+  rows: CdrRecord[];
+  total: number;
+  page: number;
+  pageSize: number;
+}
+
+export const cdrApi = {
+  list: (params: {
+    from?: string; to?: string; sourceSystem?: string; imsi?: string;
+    disposition?: string; page?: number; pageSize?: number;
+  }) =>
+    api.get<CdrListResponse>('/cdr', { params }).then(r => r.data),
+  getSettings: () =>
+    api.get<{ success: boolean; retentionDays: number }>('/cdr/settings').then(r => r.data),
+  updateSettings: (retentionDays: number) =>
+    api.put<{ success: boolean; error?: string }>('/cdr/settings', { retentionDays }).then(r => r.data),
+  syncNow: () =>
+    api.post<{ success: boolean; error?: string }>('/cdr/sync-now').then(r => r.data),
+  setKamailioAcc: (enabled: boolean) =>
+    api.post<{ success: boolean; enabled?: boolean; error?: string }>('/cdr/kamailio-acc', { enabled }).then(r => r.data),
 };
 
 // ── Audit ──
@@ -502,4 +598,8 @@ export const trafficHistoryApi = {
 
   listSubscribersWithHistory: (): Promise<{ subscribers: TrafficHistorySubscriber[] }> =>
     api.get('/traffic-history/subscribers').then(r => r.data),
+
+  periodSummary: (params: { imsi: string; period: 'day' | 'week' | 'month'; count?: number }):
+    Promise<{ period: string; points: { periodStart: string; bytes: number }[] }> =>
+    api.get('/traffic-history/period-summary', { params }).then(r => r.data),
 };

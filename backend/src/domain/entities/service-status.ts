@@ -37,7 +37,8 @@ export type ServiceName =
   | 'osmo-sip-connector' // GSM SIP tab — osmo-msc's external MNCC<->SIP bridge
   // 3G UMTS (OsmoHNBGW module) — may be absent on deployments without it.
   | 'osmo-hnbgw'         // Home NodeB Gateway (Iuh <-> IuCS/IuPS)
-  | 'osmo-mgw-hnbgw';    // Dedicated 3rd OsmoMGW instance, co-located with HNBGW
+  | 'osmo-mgw-hnbgw'     // Dedicated 3rd OsmoMGW instance, co-located with HNBGW
+  | 'ocs';               // SigScale OCS (Online Charging System, Diameter Gy)
 
 export const SERVICE_UNIT_MAP: Record<ServiceName, string> = {
   // Infrastructure
@@ -75,6 +76,7 @@ export const SERVICE_UNIT_MAP: Record<ServiceName, string> = {
   'osmo-sip-connector': 'osmo-sip-connector',
   'osmo-hnbgw': 'osmo-hnbgw',
   'osmo-mgw-hnbgw': 'osmo-mgw-hnbgw',
+  'ocs': 'ocs',
 };
 
 // Proper restart order: Control plane BEFORE user plane to avoid PFCP errors

@@ -59,9 +59,26 @@ time.sleep(0.5)
 print(drain().decode(errors='replace'))
 s.close()
 `;
-async function hnbgwVtyCommand(cmd: string): Promise<string> {
+export async function hnbgwVtyCommand(cmd: string): Promise<string> {
   const { stdout } = await nsenter('python3', ['-c', HNBGW_VTY_SCRIPT, '127.0.0.1', String(HNBGW_VTY_PORT), cmd], 10000);
   return stdout;
+}
+
+// Server-side port of frontend/src/api/hnbgw.ts's own parseHnbList() regex —
+// that one stays client-side for the read-only "Registered HNBs" list on
+// HnbPage.tsx; this copy exists so hnb-block-controller.ts's bulk "block all"
+// can resolve current HNB IPs without a round-trip through the frontend.
+// `remoteAddr` is "<ip>:<port>" (see that file's own comment on the format);
+// only the IP half is relevant for a block scoped to `ip saddr/daddr`.
+export function listRegisteredHnbIps(hnbListRaw: string): string[] {
+  const ips: string[] = [];
+  const re = /^HNB \(r=([^<]+)<->l=[^)]+\)\s+"([^"]*)"/gm;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(hnbListRaw)) !== null) {
+    const ip = m[1].split(':')[0];
+    if (ip) ips.push(ip);
+  }
+  return ips;
 }
 
 const HOST_OSMOCOM_DIR = '/proc/1/root/etc/osmocom';
@@ -107,7 +124,7 @@ const HNBGW_MGW_UNIT_PATH = `/proc/1/root/etc/systemd/system/${HNBGW_MGW_UNIT}.s
 const HNBGW_MGW_CFG_PATH  = `${HOST_OSMOCOM_DIR}/osmo-mgw-hnbgw.cfg`;
 const HNBGW_MGW_BIN       = '/usr/bin/osmo-mgw';
 
-interface HnbgwState {
+export interface HnbgwState {
   rncId: number;
   iuhLocalIp: string;
   iuhLocalPort: number;
@@ -137,7 +154,7 @@ const HNBGW_STATE_DEFAULTS: HnbgwState = {
   mgwRtpBindIp: '127.0.1.8',
 };
 
-function loadHnbgwState(): HnbgwState {
+export function loadHnbgwState(): HnbgwState {
   try {
     if (fs.existsSync(HOST_STATE)) return { ...HNBGW_STATE_DEFAULTS, ...JSON.parse(fs.readFileSync(HOST_STATE, 'utf-8')) };
   } catch { /* fall through to default */ }

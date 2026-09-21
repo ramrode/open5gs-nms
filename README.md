@@ -380,6 +380,115 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ---
 
+### PSTN Gateway *(Beta)*
+
+> ⚠️ **This module has no public SIP trunk connectivity yet** — no provider integration and no inbound DID handling by default (an optional external trunk + DID mapping phase exists but real provider connectivity is deliberately deferred). `ENABLE_PSTN_MODULE` defaults **disabled** (opt-in) — unlike most optional modules, which default enabled.
+
+- **Wires Asterisk into S-CSCF's own PSTN dispatcher** for internal extension-to-subscriber calling, confirmed working end-to-end on real hardware (iPhone↔iPhone, iPhone↔Android) with full-duplex audio
+- **Every subscriber's own real MSISDN is internally dialable**, auto-routed to IMS or 2G by their own `gsmEnabled` flag, alongside their existing extension short codes
+- **Optional external SIP trunk + inbound DID mapping** — a real, off-host-reachable transport and firewall allowlist, all 4 buildable phases shipped, real provider connection deliberately not yet configured
+- **Cross-RAN Calling** — one toggle peers this instance with Asterisk-2G, bridging 4G/5G and 2G short codes across both Asterisk instances with real AMR/AMR-WB↔GSM-FR transcoding, confirmed live with real over-the-air calls in both directions
+
+### 2G GSM (Osmocom) *(Alpha)*
+
+> ⚠️ **Real radio module.** Real spectrum transmission on real GSM hardware is a bigger blast radius than a broken lab feature — `ENABLE_GSM_MODULE` defaults **disabled** (opt-in).
+
+- **Real GSM radio access** (osmo-bsc/osmo-bts) on real nanoBTS hardware confirmed on-air — CS attach/ciphering, GPRS/EDGE packet data, and 2G↔4G SMS are all **stable**
+- **Real voice calling** needs a second, fully isolated Asterisk instance (Asterisk-2G) — osmo-msc's own built-in call handler can complete signaling but never implements real RTP audio (an upstream Osmocom limitation, not fixable in this project)
+- One button installs, configures, and wires everything needed for 2G↔2G voice with real audio
+- If a real call ever fails at channel assignment, it is **not necessarily a hardware problem** — a real `codec-support`/AMR configuration mismatch caused exactly this symptom once and had been misdiagnosed as unfixable hardware the day before
+
+### 3G UMTS (OsmoHNBGW) *(Alpha)*
+
+> ⚠️ Real femtocell hardware target. `ENABLE_HNBGW_MODULE` defaults **disabled** (opt-in).
+
+- **Home NodeB Gateway** bridging a 3G femtocell's Iuh interface to the existing 2G-era osmo-msc/osmo-sgsn core over the already-running SS7 (`osmo-stp`) — no changes needed to either of those, confirmed live
+- Reuses the 2G module's existing subscriber provisioning — no new credential setup needed for a subscriber to also work on 3G
+- A software test HNB (OsmoHNodeB) is deployable from the module's own page — proved a full live registration end-to-end before any real 3G hardware was ever touched
+- Real hardware target: an ip.access nano3G, which self-registers once pointed at this gateway (no remote-provisioning push, unlike 2G's OML)
+
+### Security Gateway (SecGW) *(Alpha — Experimental)*
+
+> ⚠️ **Alpha.** Real IPsec tunnels confirmed live, but this touches live radio traffic paths — verify carefully on your own hardware before relying on it.
+
+- **Real IPsec tunnels for CBRS radios**, confirmed live simultaneously for two different vendors with fundamentally different IPsec models: 3 Baicells eNBs (IKEv2 Configuration Payload / virtual-IP based) and 1 Nokia AirScale (static tunnel endpoints + traffic selectors — Nokia has no Configuration Payload support at all)
+- **Real S1AP/GTP-U traffic verified flowing through the tunnel** via packet capture — ESP wrapper, decrypted SCTP heartbeat to MME
+- **Per-radio dedicated pool addresses**, never a shared CIDR — a shared selector setup caused a real outage (last-negotiating radio silently stole the kernel XFRM policy slot from the others)
+- Nokia radios needing to reach anything beyond the auto-derived core NF pair (e.g. the DNS server) get it via an explicit `extraLocalCidrs` "Protect" policy, matched by widening this gateway's own local traffic selector
+- `ENABLE_SECGW_MODULE` defaults **disabled** (opt-in)
+
+### RF Planning *(Alpha)*
+
+> ⚠️ **Early and actively being built out.** Expect incomplete phases and possible breaking changes between releases.
+
+- **Deterministic LTE link-budget / site-geometry engine** — Phase 1 of a planned multi-phase tool
+- Not yet a full replacement for a commercial planning suite — treat outputs as a starting point, not a final design
+- `ENABLE_RF_PLANNING_MODULE` defaults **disabled** (opt-in)
+
+### IP Plan Tool *(Beta)*
+
+- **Bulk re-address a whole deployment from one page**, instead of visiting every module's own page to re-type the same new subnet
+- **Propose → Review → Apply** — never silently overwrites a module's own IP; proposes a plan against the current live state of every module, shows a current-vs-proposed diff, and only touches anything you explicitly check
+- Covers core-17 (MME/AMF/UPF/SGW addresses), Security Gateway, VoWiFi, 2G GSM, IMS, PSTN's external trunk, and MMS — SEPP and the DNS listen address are always plan-only, since their only live-apply path is a much larger action better done from their own dedicated pages
+- Live per-row restart-cost hints before you apply anything
+
+### RAN Kill Switches *(Beta)*
+
+> ⚠️ **Real, disruptive actions on live radios**, not a simulation — the 2G one in particular has a genuinely different real-world impact than the other three.
+
+- **Five Dashboard buttons**: Block RAN (all four generations at once) plus Block 2G / 3G / 4G / 5G individually — each flashes red for as long as anything of that generation is currently blocked, and doubles as the unblock-all action while flashing
+- **4G/5G/3G** sever the radio's own path to the core on this host only (nftables) — the radio itself is never touched and can be restored instantly
+- **2G is genuinely different** — it's a real administrative lock at osmo-bsc itself, dropping every camped UE immediately, the same real device-level action as the per-radio Block button on the RAN page
+- The same flash-red "currently blocked" indicator also applies to every individual per-radio Block/Unblock button on the RAN page, not just the Dashboard's aggregate buttons
+
+### SigScale OCS (Online Charging) *(Beta)*
+
+> ⚠️ **This module is in beta** and touches an always-on core NF's Diameter peer list (SMF). `ENABLE_OCS_MODULE` defaults **disabled** (opt-in).
+
+- **Real-time prepaid credit-control charging** — Diameter Gy (data) wired to Open5GS SMF's own native Gy client (present since v2.4.7, previously completely dormant in this deployment), plus Diameter Ro (voice/airtime charging) sharing the same listener
+- **4G/EPC only** — Open5GS's SMF has no 5G online-charging (Nchf) client upstream, so 5G NR sessions are never covered by this integration
+- **One-button Configure** — installs SigScale OCS (a real Erlang/OTP application via its own apt package), registers SMF as a trusted Diameter client, upserts the Gy peer into `smf.conf`, and verifies a real `STATE_OPEN` connection
+- No rating-plan/balance/subscriber CRUD in this NMS — links out to OCS's own Polymer web GUI and REST API docs instead
+- Getting real charging fully working (both Gy and Ro) surfaced and fixed 9 separate real bugs across freeDiameter-vs-cdp connectivity quirks and the compiled `ims_charging.so` module itself — see `docs/features.md` for the full writeup
+
+### Charging Plans *(Beta)*
+
+> ⚠️ **Beta.** Depends on SigScale OCS being installed and configured first.
+
+- **A deliberately simplified data + voice cap GUI** over SigScale OCS's own full rating-plan vocabulary — built per direct user feedback that "the sigscale gui is too complex"
+- One GUI "Plan" (name + data cap GB + voice cap minutes) maps to one real OCS bundle offer
+- **Auto-provisioned "Unlimited" plan** on every OCS Configure — a deliberately huge finite cap (1,000,000 GB / 1,000,000 min), not a dedicated no-cap code path
+- Subscriber assignment from the Subscribers page, both bulk-select and per-row
+- A known, still-unresolved OCS-side rating-engine bug can leak stuck reservations across subscribers — mitigated by an automatic background guard that sweeps and clears stale reservations every 30 minutes (a mitigation, not a fix for the underlying engine bug)
+
+### Call History (CDR) *(Beta)*
+
+> ⚠️ **Beta.** One of three phases is not yet confirmed working end-to-end — see below.
+
+- **Unified call detail records across PSTN, 2G, and 4G/5G IMS**, synced into their own MongoDB collection from each system's own real source (not a fresh primary store)
+- **Phase 1 (PSTN Gateway)** — stable, verified against a real 76+-row dataset
+- **Phase 2 (Asterisk-2G)** — code deployed, but a real end-to-end test-call confirmation is still outstanding
+- **Phase 3 (direct 4G/5G IMS-to-IMS calls)** — via Kamailio's own `acc` module, confirmed fully working end-to-end against real test calls, independent runtime toggle from its own compile-time build flag
+- Configurable retention (default 180 days)
+
+### Traffic History *(Stable)*
+
+- **Aggregate and per-subscriber bandwidth history**, built entirely on this project's already-deployed Prometheus stack rather than a second time-series database — an earlier version of this feature built its own MongoDB store; it was replaced once the team realized Prometheus was already deployed and already doing the job
+- Real cumulative counters exposed via the NMS backend's own `/metrics` endpoint, scraped alongside every core NF
+- Retention is whatever Prometheus's own retention window is set to (shared with NF metrics), not independently configurable per feature
+
+### UE Signal Monitoring *(New — Community Contributed)*
+
+> New in PR #32. **Baicells-native connector only** — other vendors need a generic JSON connector, which requires the radio to already expose its own metrics in that shape, so this is not a drop-in for every vendor.
+
+- **Per-UE RSRP/RSRQ/SINR/BLER/MCS/CQI/throughput**, correlated with subscriber identity (IMSI/ICCID/MSISDN)
+- **7-day SQLite history** per UE
+- **AES-256-GCM encrypted radio credentials**
+- **Admin-triggered downlink wake** for idle UEs, so a signal sample can be captured on demand
+- `ENABLE_UE_SIGNAL_MODULE` defaults **enabled** — a visibility gate, not an install/uninstall lifecycle like most other opt-in modules
+
+---
+
 ## 🚀 Quick Start
 
 ### Prerequisites

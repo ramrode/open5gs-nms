@@ -8,6 +8,7 @@ import {
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import { vowifiApi } from '../api/vowifi';
+import { ipPlanApi } from '../api/ip-plan';
 import type {
   VowifiStatus, VowifiConfigFile, VectorcoreStats, VectorcoreSession, VectorcoreClientDiag,
   VectorcoreIpsecStats, VectorcoreGtpuStats, VectorcoreStatusInfo,
@@ -134,6 +135,13 @@ function SetupTab({ status, refresh }: { status: VowifiStatus | null; refresh: (
     if (status?.aaaListenIp) setAaaListenIp(status.aaaListenIp);
     if (status?.epdgInterfaceMode) setInterfaceMode(status.epdgInterfaceMode);
   }, [status?.epdgIp, status?.aaaListenIp, status?.epdgInterfaceMode]);
+
+  // Pre-fill from the Auto-Config page's Static IP Plan when never
+  // configured here yet — same smart-default pattern as SecGWPage.
+  useEffect(() => {
+    if (status?.epdgIp) return;
+    ipPlanApi.get('vowifi-epdg').then(ip => { if (ip) setEpdgIp(ip); }).catch(() => {});
+  }, [status?.epdgIp]);
 
   const streamLog = useCallback(async () => {
     streamRef.current?.abort();

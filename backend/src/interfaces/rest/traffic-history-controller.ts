@@ -122,6 +122,61 @@ export const createTrafficHistoryRouter = (
     }
   });
 
+  // ── GET /period-summary — total data volume per day/week/month, for the
+  // per-UE "usage over time" view. Uses PromQL increase() (total counter
+  // growth over each window), not rate() — this endpoint answers "how many
+  // bytes" per period, not "how many Mbps" at an instant, so it deliberately
+  // does NOT reuse the '/' endpoint's rate()-based query. 'month' is
+  // approximated as a fixed 30d window (PromQL has no calendar-month
+  // duration literal) — acceptable here since Prometheus's own retention is
+  // 30 days anyway (see CLAUDE.md), so a precise calendar month rarely
+  // matters in practice. query_range's own step==window-size gives
+  // non-overlapping buckets, one point per period.
+  router.get('/period-summary', async (req: Request, res: Response) => {
+    try {
+      const imsi = req.query.imsi as string | undefined;
+      if (!imsi) {
+        res.status(400).json({ error: 'imsi is required' });
+        return;
+      }
+      const period = (req.query.period as string) === 'week' ? 'week'
+        : (req.query.period as string) === 'month' ? 'month' : 'day';
+      const periodSeconds = period === 'week' ? 7 * 24 * 3600 : period === 'month' ? 30 * 24 * 3600 : 24 * 3600;
+      const rangeLit = period === 'week' ? '7d' : period === 'month' ? '30d' : '1d';
+      const count = Math.min(Math.max(Number(req.query.count) || 14, 1), 90);
+
+      const endSec = Math.floor(Date.now() / 1000);
+      const startSec = endSec - periodSeconds * count;
+      const labelFilter = `{imsi="${imsi}"}`;
+
+      const [upResult, downResult] = await Promise.all([
+        promQueryRange(prometheusUrl, `increase(open5gs_subscriber_up_bytes_total${labelFilter}[${rangeLit}])`, startSec, endSec, periodSeconds),
+        promQueryRange(prometheusUrl, `increase(open5gs_subscriber_down_bytes_total${labelFilter}[${rangeLit}])`, startSec, endSec, periodSeconds),
+      ]);
+
+      const byTs = new Map<number, number>();
+      for (const series of upResult) {
+        for (const [ts, val] of series.values) byTs.set(ts, (byTs.get(ts) ?? 0) + Number(val));
+      }
+      for (const series of downResult) {
+        for (const [ts, val] of series.values) byTs.set(ts, (byTs.get(ts) ?? 0) + Number(val));
+      }
+
+      const points = Array.from(byTs.entries())
+        .sort(([a], [b]) => a - b)
+        .map(([ts, bytes]) => ({
+          periodStart: new Date(ts * 1000).toISOString(),
+          bytes: Number.isFinite(bytes) ? Math.max(bytes, 0) : 0,
+        }));
+
+      res.json({ period, points });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      logger.error({ err: msg }, 'Failed to query period summary from Prometheus');
+      res.status(500).json({ error: msg });
+    }
+  });
+
   // ── GET /subscribers — IMSIs currently tracked, for the filter dropdown ─────
   router.get('/subscribers', async (_req: Request, res: Response) => {
     try {

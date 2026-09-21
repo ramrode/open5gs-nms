@@ -39,6 +39,10 @@ export const FEATURES = {
   // cs7/IuPS block). Same posture as every other real-RAN module: not
   // default-on.
   hnbgw: import.meta.env.VITE_ENABLE_HNBGW === 'true',
+  ocs: import.meta.env.VITE_ENABLE_OCS === 'true',
+  // Own flag, not piggybacked on ocs — Phase 3 (Kamailio acc module wiring)
+  // touches a live core IMS component, same risk posture as pstn/gsm/secgw.
+  cdr: import.meta.env.VITE_ENABLE_CDR === 'true',
   // Opt-in like pstn/mms/secgw (not default-on like sms/ims) — not yet meant for
   // general/public deployments, only for hosts that explicitly enable it.
   rfPlanning: import.meta.env.VITE_ENABLE_RF_PLANNING === 'true',

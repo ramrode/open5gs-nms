@@ -1,13 +1,14 @@
 import { useState, useEffect } from 'react';
 import {
   Play, Square, RotateCw, Zap, Radio, Wifi, Container, AlertCircle,
-  Power, PowerOff, Gauge, Settings2, RadioTower,
+  Power, PowerOff, Gauge, Settings2, RadioTower, Antenna,
 } from 'lucide-react';
 import { useServiceStore } from '../../stores';
 import { serviceApi } from '../../api';
 import { vowifiApi, type VowifiStatus } from '../../api/vowifi';
 import { mmsApi, type MmsStatus } from '../../api/mms';
 import { vectorcoreSmscApi, type VectorcoreSmscStatus } from '../../api/vectorcoreSmsc';
+import { ocsApi, type OcsStatus } from '../../api/ocs';
 import { asterisk2gApi, type Asterisk2gStatus } from '../../api/asterisk-2g';
 import { SpeedTestServerModal } from '../trafficHistory/SpeedTestServerModal';
 import type { ServiceStatus } from '../../types';
@@ -29,6 +30,8 @@ const SERVICES_OSMO_GSM = ['osmo-bsc', 'osmo-mgw', 'osmo-bts-virtual', 'osmo-pcu
 // 2G-era one above (see hnbgw-controller.ts's own module comment).
 const SERVICES_OSMO_HNBGW = ['osmo-hnbgw', 'osmo-mgw-hnbgw'];
 const SERVICES_OSMO   = [...SERVICES_OSMO_SGS, ...SERVICES_OSMO_GSM, ...SERVICES_OSMO_HNBGW];
+// SigScale OCS (Online Charging, Diameter Gy) — not Osmocom, its own section.
+const SERVICES_OCS = ['ocs'];
 
 function formatBytes(bytes: number | null | undefined): string {
   if (bytes === null || bytes === undefined || bytes === 0) return '—';
@@ -64,6 +67,7 @@ function serviceManageTarget(name: string): { label: string; target: string } {
   if (SERVICES_OSMO_SGS.includes(name)) return { label: 'SMS', target: 'sms' };
   if (SERVICES_OSMO_GSM.includes(name)) return { label: '2G GSM', target: 'gsm' };
   if (SERVICES_OSMO_HNBGW.includes(name)) return { label: '3G UMTS', target: 'hnbgw' };
+  if (SERVICES_OCS.includes(name)) return { label: 'OCS', target: 'ocs' };
   if (name === 'mongodb') return { label: 'Backup', target: 'backup' };
   return { label: 'Config', target: 'config' };
 }
@@ -228,6 +232,7 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
   const [acting4G, setActing4G] = useState(false);
   const [acting5G, setActing5G] = useState(false);
   const [acting2G, setActing2G] = useState(false);
+  const [acting3G, setActing3G] = useState(false);
   const [actingByName, setActingByName] = useState<Record<string, boolean>>({});
   const [chrony, setChrony] = useState<{ installed: boolean; active: boolean; refSource?: string } | null>(null);
   const [chronyActing, setChronyActing] = useState(false);
@@ -235,6 +240,7 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
   const [mmsStatus, setMmsStatus] = useState<MmsStatus | null>(null);
   const [vectorcoreSmscStatus, setVectorcoreSmscStatus] = useState<VectorcoreSmscStatus | null>(null);
   const [asterisk2gStatus, setAsterisk2gStatus] = useState<Asterisk2gStatus | null>(null);
+  const [ocsStatus, setOcsStatus] = useState<OcsStatus | null>(null);
   const [speedtest, setSpeedtest] = useState<SpeedTestStatus | null>(null);
   const [speedtestActing, setSpeedtestActing] = useState(false);
   const [showSpeedtestModal, setShowSpeedtestModal] = useState(false);
@@ -274,6 +280,10 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
     // its own status fetch here rather than folding into the Osmocom section
     // above (it isn't Osmocom software).
     asterisk2gApi.getStatus().then(setAsterisk2gStatus).catch(() => {});
+    // SigScale OCS — the generic `ocs` systemd row below (SERVICES_OCS
+    // section) only knows active/inactive; this fetch feeds its subtitle
+    // with the one thing that's actually OCS-specific: Gy peer state.
+    ocsApi.getStatus().then(setOcsStatus).catch(() => {});
   }, []);
 
   const handleChronyAction = async (action: 'start' | 'stop' | 'restart') => {
@@ -323,6 +333,7 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
   const is5GAnyRunning = statuses.some(s => SERVICES_5G.includes(s.name) && s.active);
   const is4GAnyRunning = statuses.some(s => SERVICES_4G.includes(s.name) && s.active);
   const is2GAnyRunning = statuses.some(s => SERVICES_OSMO_GSM.includes(s.name) && s.active) || !!asterisk2gStatus?.serviceActive;
+  const is3GAnyRunning = statuses.some(s => SERVICES_OSMO_HNBGW.includes(s.name) && s.active);
 
   const doBulkAction = async (action: 'start' | 'stop' | 'restart'): Promise<void> => {
     if (!confirm(`Are you sure you want to ${action} ALL services?`)) return;
@@ -336,11 +347,11 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
     finally { setBulkActing(false); }
   };
 
-  const GROUP_SERVICES: Record<'4g' | '5g' | '2g', string[]> = { '5g': SERVICES_5G, '4g': SERVICES_4G, '2g': SERVICES_OSMO_GSM };
-  const GROUP_RUNNING:  Record<'4g' | '5g' | '2g', boolean>  = { '5g': is5GAnyRunning, '4g': is4GAnyRunning, '2g': is2GAnyRunning };
-  const GROUP_SET_ACTING: Record<'4g' | '5g' | '2g', (v: boolean) => void> = { '5g': setActing5G, '4g': setActing4G, '2g': setActing2G };
+  const GROUP_SERVICES: Record<'4g' | '5g' | '2g' | '3g', string[]> = { '5g': SERVICES_5G, '4g': SERVICES_4G, '2g': SERVICES_OSMO_GSM, '3g': SERVICES_OSMO_HNBGW };
+  const GROUP_RUNNING:  Record<'4g' | '5g' | '2g' | '3g', boolean>  = { '5g': is5GAnyRunning, '4g': is4GAnyRunning, '2g': is2GAnyRunning, '3g': is3GAnyRunning };
+  const GROUP_SET_ACTING: Record<'4g' | '5g' | '2g' | '3g', (v: boolean) => void> = { '5g': setActing5G, '4g': setActing4G, '2g': setActing2G, '3g': setActing3G };
 
-  const doGroupToggle = async (group: '4g' | '5g' | '2g'): Promise<void> => {
+  const doGroupToggle = async (group: '4g' | '5g' | '2g' | '3g'): Promise<void> => {
     const services = GROUP_SERVICES[group];
     const anyRunning = GROUP_RUNNING[group];
     const action = anyRunning ? 'stop' : 'start';
@@ -383,6 +394,18 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
     }
   };
 
+  // OCS is the one entry in SERVICE_UNIT_MAP whose systemd active/inactive
+  // state alone doesn't tell the whole story — a healthy `ocs` process can
+  // still have no working Diameter Gy peer. Surfaced as a subtitle rather
+  // than a bespoke row (unlike vectorCoreRow below) so it keeps the real
+  // PID/uptime/memory/restart-count columns and independent start/stop/
+  // restart that the generic systemd-backed row already gives it.
+  const ocsGySubtitle = (s: OcsStatus | null): string | undefined => {
+    if (!s?.installed) return undefined;
+    if (!s.gyPeerWired) return 'Gy peer not configured';
+    return s.gyPeerOpen ? 'Gy peer: STATE_OPEN' : 'Gy peer: wired, connecting…';
+  };
+
   // Systemd-unit-backed rows (core-17 NFs + Osmocom) — full detail, start/
   // stop/restart, boot-enable toggle, and a link to wherever this service
   // is actually configured.
@@ -393,6 +416,7 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
       name: s.name.toUpperCase(),
       unitName: s.unitName,
       badge: s.source === 'docker' ? { label: 'docker', icon: <Container className="w-2.5 h-2.5" />, color: 'bg-blue-500/10 text-blue-400 border-blue-500/20' } : undefined,
+      subtitle: s.name === 'ocs' ? ocsGySubtitle(ocsStatus) : undefined,
       active: s.active,
       stateLabel: `${s.state}/${s.subState}`,
       enabled: s.enabled,
@@ -549,6 +573,26 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
             {acting2G ? '...' : is2GAnyRunning ? 'Stop 2G' : 'Start 2G'}
           </button>
 
+          {/* 3G group toggle — osmo-hnbgw + its dedicated osmo-mgw-hnbgw
+              instance (SERVICES_OSMO_HNBGW). Both units are already in the
+              generic bulkAction's SERVICE_UNIT_MAP, so unlike 2G's
+              Asterisk-2G there's no extra module-specific start/stop call
+              needed alongside it. */}
+          <button
+            onClick={() => doGroupToggle('3g')}
+            disabled={acting3G || bulkActing}
+            className={clsx(
+              'flex items-center gap-2 text-sm font-medium px-3 py-2 rounded-lg border transition-all',
+              is3GAnyRunning
+                ? 'bg-violet-500/10 text-violet-400 border-violet-500/30 hover:bg-violet-500/20'
+                : 'bg-nms-surface-2 text-nms-text-dim border-nms-border hover:text-nms-text',
+            )}
+            title={is3GAnyRunning ? 'Stop all 3G services' : 'Start all 3G services'}
+          >
+            <Antenna className="w-4 h-4" />
+            {acting3G ? '...' : is3GAnyRunning ? 'Stop 3G' : 'Start 3G'}
+          </button>
+
           <div className="w-px bg-nms-border mx-1" />
 
           <button
@@ -605,6 +649,14 @@ export function ServicesPage({ onNavigate }: { onNavigate?: (tab: string) => voi
         <div>
           <SectionHeader label="Shared 4G + 5G" color="text-purple-400" />
           <ServiceTable rows={statuses.filter(s => SERVICES_SHARED.includes(s.name)).map(serviceRow)} />
+        </div>
+      )}
+
+      {/* SigScale OCS (Online Charging, Diameter Gy) — 4G/EPC only, opt-in module */}
+      {statuses.some(s => SERVICES_OCS.includes(s.name)) && (
+        <div>
+          <SectionHeader label="Charging" color="text-emerald-400" />
+          <ServiceTable rows={statuses.filter(s => SERVICES_OCS.includes(s.name)).map(serviceRow)} />
         </div>
       )}
 

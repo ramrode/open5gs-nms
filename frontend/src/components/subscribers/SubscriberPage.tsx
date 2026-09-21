@@ -1,12 +1,13 @@
-import { useEffect, useState, useRef, useMemo, useCallback } from 'react';
-import { Plus, Search, Trash2, Edit, X, Save, CreditCard, Copy, Download, Upload, Shield, Network, List, ArrowUp, ArrowDown, ChevronDown, Users, ChevronRight, Pencil, Unlink, Smartphone, UserX, UserCheck } from 'lucide-react';
+import { useEffect, useLayoutEffect, useState, useRef, useMemo, useCallback } from 'react';
+import { createPortal } from 'react-dom';
+import { Plus, Search, Trash2, Edit, X, Save, CreditCard, Copy, Download, Upload, Shield, Network, List, ArrowUp, ArrowDown, ChevronDown, Users, ChevronRight, Pencil, Unlink, Smartphone, UserX, UserCheck, Wallet, Check } from 'lucide-react';
 import { clsx } from 'clsx';
 import { EsimGeneratorModal } from './EsimGeneratorModal';
 import { ConfirmModal } from '../common/ConfirmModal';
 import { getBlockedUes, blockUe, unblockUe } from '../../api/ueBlock';
 import { useSubscriberStore, useSuciStore } from '../../stores';
-import { subscriberApi, subscriberGroupsApi } from '../../api';
-import type { SubscriberGroup } from '../../api';
+import { subscriberApi, subscriberGroupsApi, chargingPlansApi } from '../../api';
+import type { SubscriberGroup, ChargingPlan } from '../../api';
 import { apnProfilesApi, type ApnProfileListEntry } from '../../api/apnProfiles';
 import { useAuth } from '../../contexts/AuthContext';
 import { FEATURES } from '../../config/features';
@@ -68,6 +69,179 @@ function DnnSelect({
           placeholder="Enter DNN"
           autoFocus
         />
+      )}
+    </div>
+  );
+}
+
+// ── Generic inline-editable table cell ──────────────────────────────────────
+// Click the value (or its pencil, shown on hover) to edit in place; Enter,
+// blur, or the check button all commit, Escape/✕ reverts. Mirrors the
+// established RadioTagCell pattern from RANPage.tsx, with one deliberate
+// difference: the Check/✕ buttons use onMouseDown+preventDefault so clicking
+// them doesn't first fire the input's onBlur (which would otherwise race its
+// own save against — or silently precede — whatever the button itself does).
+function InlineTextCell({
+  value, isAdmin, onSave, placeholder, mono, widthClass, renderDisplay,
+}: {
+  value: string;
+  isAdmin: boolean;
+  onSave: (value: string) => Promise<void>;
+  placeholder?: string;
+  mono?: boolean;
+  widthClass?: string;
+  renderDisplay?: (value: string) => JSX.Element;
+}): JSX.Element {
+  const [editing, setEditing] = useState(false);
+  const [val, setVal] = useState(value);
+  const [saving, setSaving] = useState(false);
+
+  const handleSave = async () => {
+    if (val.trim() === value) { setEditing(false); return; }
+    setSaving(true);
+    try {
+      await onSave(val.trim());
+      toast.success('Updated');
+      setEditing(false);
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err?.message ?? 'Update failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') handleSave();
+    if (e.key === 'Escape') { setVal(value); setEditing(false); }
+  };
+
+  if (editing) {
+    return (
+      <div className="flex items-center gap-1.5">
+        <input
+          autoFocus
+          disabled={saving}
+          className={clsx('nms-input text-xs py-1 px-1.5 h-7', mono && 'font-mono', widthClass ?? 'w-28')}
+          value={val}
+          onChange={e => setVal(e.target.value)}
+          onKeyDown={handleKeyDown}
+          onBlur={handleSave}
+          placeholder={placeholder}
+        />
+        <button onMouseDown={e => e.preventDefault()} onClick={handleSave} disabled={saving}
+          className="text-nms-green hover:text-nms-green/80 disabled:opacity-50 shrink-0" title="Save">
+          <Check className="w-3.5 h-3.5" />
+        </button>
+        <button onMouseDown={e => e.preventDefault()} onClick={() => { setVal(value); setEditing(false); }} disabled={saving}
+          className="text-nms-text-dim hover:text-nms-text shrink-0" title="Cancel">
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+    );
+  }
+  return (
+    <div
+      className={clsx(
+        'inline-flex items-center rounded px-1 -mx-1 py-0.5 -my-0.5',
+        isAdmin && 'cursor-pointer hover:bg-nms-surface-2 transition-colors',
+      )}
+      onClick={() => { if (isAdmin) { setVal(value); setEditing(true); } }}
+    >
+      {renderDisplay ? renderDisplay(value) : (value || <span className="text-nms-text-dim">—</span>)}
+    </div>
+  );
+}
+
+// ── Click-to-toggle dropdown menu ───────────────────────────────────────────
+// Replaces the old `group-hover:block` CSS-only dropdowns (Set Plan, Add to
+// group, Add to plan) — those closed the instant the mouse crossed the small
+// gap between trigger and menu on the way down to click an option, since
+// hover state is lost the moment the cursor leaves the trigger element.
+// State-driven open/close plus a document-level click-outside/Escape
+// listener means the menu stays open until the operator actually picks
+// something or dismisses it.
+type DropdownPos = { top?: number; bottom?: number; left?: number; right?: number };
+
+function DropdownMenu({
+  trigger, children, align = 'left', side = 'bottom', menuClassName,
+}: {
+  trigger: (props: { onClick: () => void; open: boolean }) => JSX.Element;
+  children: (close: () => void) => React.ReactNode;
+  align?: 'left' | 'right';
+  side?: 'top' | 'bottom';
+  menuClassName?: string;
+}): JSX.Element {
+  const [open, setOpen] = useState(false);
+  const [pos, setPos] = useState<DropdownPos | null>(null);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const menuRef = useRef<HTMLDivElement>(null);
+  const hasFlippedRef = useRef(false);
+
+  // Portaled to document.body and positioned from the trigger's real
+  // viewport coordinates — this table lives inside a `overflow-hidden` card
+  // (for its rounded corners), which silently clipped a plain CSS-positioned
+  // dropdown for any row near the card's bottom edge. Two passes: place it
+  // first per the `side` prop, then — once its real rendered height is known
+  // — flip top<->bottom if it still runs off the viewport (at most once, so
+  // a menu taller than the viewport can't ping-pong forever).
+  useLayoutEffect(() => {
+    if (!open || !anchorRef.current) return;
+    hasFlippedRef.current = false;
+    const rect = anchorRef.current.getBoundingClientRect();
+    const GAP = 4;
+    setPos({
+      ...(side === 'bottom' ? { top: rect.bottom + GAP } : { bottom: window.innerHeight - rect.top + GAP }),
+      ...(align === 'left' ? { left: rect.left } : { right: window.innerWidth - rect.right }),
+    });
+  }, [open, side, align]);
+
+  useLayoutEffect(() => {
+    if (!open || !pos || hasFlippedRef.current || !menuRef.current || !anchorRef.current) return;
+    const menuRect = menuRef.current.getBoundingClientRect();
+    const rect = anchorRef.current.getBoundingClientRect();
+    const GAP = 4;
+    if (pos.top !== undefined && menuRect.bottom > window.innerHeight) {
+      hasFlippedRef.current = true;
+      setPos(p => p && ({ ...p, top: undefined, bottom: window.innerHeight - rect.top + GAP }));
+    } else if (pos.bottom !== undefined && menuRect.top < 0) {
+      hasFlippedRef.current = true;
+      setPos(p => p && ({ ...p, bottom: undefined, top: rect.bottom + GAP }));
+    }
+  }, [open, pos]);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (anchorRef.current?.contains(target) || menuRef.current?.contains(target)) return;
+      setOpen(false);
+    };
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    // A dropdown anchored to a table row that no longer matches the trigger's
+    // on-screen position (the page scrolled underneath it) is worse than no
+    // dropdown — close rather than let it visually detach.
+    const onScroll = () => setOpen(false);
+    document.addEventListener('mousedown', onDocMouseDown);
+    document.addEventListener('keydown', onKeyDown);
+    window.addEventListener('scroll', onScroll, true);
+    return () => {
+      document.removeEventListener('mousedown', onDocMouseDown);
+      document.removeEventListener('keydown', onKeyDown);
+      window.removeEventListener('scroll', onScroll, true);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative inline-block" ref={anchorRef}>
+      {trigger({ onClick: () => setOpen(o => !o), open })}
+      {open && pos && createPortal(
+        <div
+          ref={menuRef}
+          style={{ position: 'fixed', top: pos.top, bottom: pos.bottom, left: pos.left, right: pos.right }}
+          className={clsx('z-50 bg-nms-surface border border-nms-border rounded-lg shadow-2xl py-1', menuClassName)}
+        >
+          {children(() => setOpen(false))}
+        </div>,
+        document.body,
       )}
     </div>
   );
@@ -1787,12 +1961,37 @@ function SIMGeneratorDialog({ onClose }: {
   );
 }
 
-function SubForm({ sub, onSave, onCancel, isNew }: {
+function SubForm({ sub, onSave, onCancel, isNew, plans, onPlanChanged }: {
   sub: Subscriber; onSave: (s: Subscriber) => Promise<void>; onCancel: () => void; isNew: boolean;
+  plans?: ChargingPlan[]; onPlanChanged?: () => void;
 }): JSX.Element {
   const [form, setForm] = useState<Subscriber>(sub);
   const [saving, setSaving] = useState(false);
   const save = async () => { setSaving(true); try { await onSave(form); } finally { setSaving(false); } };
+
+  // Charging plan selector — independent of the rest of this form/save flow
+  // (plans live in their own nms_charging_plans collection, never on the
+  // subscriber document itself, same as Subscriber Groups) — applies
+  // immediately on change rather than waiting for the main Save button.
+  const currentPlan = (plans ?? []).find(p => p.imsis.includes(sub.imsi)) ?? null;
+  const [assigningPlan, setAssigningPlan] = useState(false);
+  const handlePlanChange = async (planId: string) => {
+    if (!planId || planId === currentPlan?._id) return;
+    setAssigningPlan(true);
+    try {
+      const result = await chargingPlansApi.assign(planId, [sub.imsi]);
+      if (result.success) {
+        toast.success(`Assigned to "${plans?.find(p => p._id === planId)?.name}"`);
+        onPlanChanged?.();
+      } else {
+        toast.error(result.error || 'Assign failed');
+      }
+    } catch (err: any) {
+      toast.error(`Assign failed: ${err?.response?.data?.error ?? err.message}`);
+    } finally {
+      setAssigningPlan(false);
+    }
+  };
 
   // #30: DNN dropdown, populated from APN Profiles — falls back to the
   // original free-text entry untouched when no profiles are defined yet
@@ -1939,6 +2138,24 @@ function SubForm({ sub, onSave, onCancel, isNew }: {
                 placeholder="Auto-generated"
               />
             </div>
+            {FEATURES.ocs && !isNew && (
+              <div>
+                <label className="nms-label">Charging Plan</label>
+                <select
+                  className="nms-input text-sm"
+                  value={currentPlan?._id ?? ''}
+                  disabled={assigningPlan}
+                  onChange={e => handlePlanChange(e.target.value)}
+                >
+                  <option value="" disabled>{(plans ?? []).length === 0 ? 'No plans created yet' : 'Select a plan…'}</option>
+                  {(plans ?? []).map(p => (
+                    <option key={p._id} value={p._id}>
+                      {p.name} ({p.dataCapGB >= 100_000 ? 'Unlimited' : `${p.dataCapGB} GB`} / {p.voiceCapMinutes >= 100_000 ? 'Unlimited' : `${p.voiceCapMinutes} min`})
+                    </option>
+                  ))}
+                </select>
+              </div>
+            )}
           </div>
           {(FEATURES.gsm || FEATURES.hnbgw) && (
             <label className="flex items-center gap-2 mt-4 cursor-pointer">
@@ -2653,6 +2870,21 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
 
   useEffect(() => { fetchGroups(); }, [fetchGroups]);
 
+  // Charging plan assignment — same bulk-select UX as groups above, not a
+  // separate interaction model (see ChargingPlansPage.tsx for plan CRUD
+  // itself; assignment lives here since it's a per-subscriber action).
+  const [plans, setPlans] = useState<ChargingPlan[]>([]);
+  const fetchPlans = useCallback(async () => {
+    if (!FEATURES.ocs) return;
+    try { setPlans(await chargingPlansApi.list()); } catch { /* silent */ }
+  }, []);
+  useEffect(() => { fetchPlans(); }, [fetchPlans]);
+  const planByImsi = useMemo(() => {
+    const map = new Map<string, ChargingPlan>();
+    for (const p of plans) for (const imsi of p.imsis) map.set(imsi, p);
+    return map;
+  }, [plans]);
+
   const toggleSelect = (imsi: string) => {
     setSelectedImsis(prev => {
       const next = new Set(prev);
@@ -2662,6 +2894,48 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
   };
 
   const clearSelection = () => setSelectedImsis(new Set());
+
+  // ── Inline table-cell editing (Nickname / MSISDN / per-session APN & IPv4) ──
+  // APN/IPv4 live inside the nested slice/session array server-side, so those
+  // two fetch the full subscriber and mutate just the targeted session by flat
+  // index (same slice-major order mongo-subscriber-repository.ts flattens the
+  // list view's `sessions` in), then PUT back only the `slice` key —
+  // subscriber-management.ts's update() only acts on dto.slice/dto.imsi when
+  // those keys are actually present, so this is a safe partial update, never
+  // a full-object overwrite of fields this table doesn't even show (security,
+  // ambr, etc).
+  const saveNickname = async (imsi: string, value: string) => {
+    await subscriberApi.update(imsi, { nickname: value || undefined });
+    await fetch();
+  };
+
+  const saveMsisdn = async (imsi: string, value: string) => {
+    const parsed = value.split(',').map(s => s.trim()).filter(Boolean);
+    await subscriberApi.update(imsi, { msisdn: parsed });
+    await fetch();
+  };
+
+  const saveSessionField = async (imsi: string, sessionIdx: number, field: 'name' | 'ipv4', value: string) => {
+    if (field === 'name' && !value) throw new Error('APN cannot be empty');
+    if (field === 'ipv4' && value && !/^(\d{1,3}\.){3}\d{1,3}$/.test(value)) {
+      throw new Error('Enter a valid IPv4 address (e.g. 10.45.0.2)');
+    }
+    const full = await subscriberApi.get(imsi);
+    const flat: { si: number; sj: number }[] = [];
+    full.slice.forEach((sl, si) => sl.session.forEach((_, sj) => flat.push({ si, sj })));
+    const target = flat[sessionIdx];
+    if (!target) throw new Error('Session not found — try refreshing the page');
+    const newSlice = full.slice.map((sl, si) => si !== target.si ? sl : {
+      ...sl,
+      session: sl.session.map((sess, sj) => sj !== target.sj ? sess : (
+        field === 'name'
+          ? { ...sess, name: value }
+          : { ...sess, ue: { ...sess.ue, ipv4: value || undefined } }
+      )),
+    });
+    await subscriberApi.update(imsi, { slice: newSlice });
+    await fetch();
+  };
 
   // Client-side sort — no backend call, instant
   const sortedSubscribers = useMemo(() => {
@@ -2990,8 +3264,10 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
               toast.error(e?.message || 'Failed to update subscriber');
             }
           }}
-          onCancel={() => { setEditImsi(null); setEditSub(null); }} 
-          isNew={false} 
+          onCancel={() => { setEditImsi(null); setEditSub(null); }}
+          isNew={false}
+          plans={plans}
+          onPlanChanged={fetchPlans}
         />
       )}
 
@@ -3009,29 +3285,69 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
           </button>
           {/* Add selected to existing group */}
           {groups.length > 0 && (
-            <div className="relative group">
-              <button className="nms-btn-ghost text-xs flex items-center gap-1.5">
-                Add to group <ChevronDown className="w-3 h-3" />
-              </button>
-              <div className="absolute bottom-full mb-1 left-0 hidden group-hover:block bg-nms-surface border border-nms-border rounded-lg shadow-2xl py-1 min-w-40 z-50">
-                {groups.map(g => (
-                  <button
-                    key={g._id}
-                    onClick={async () => {
-                      const merged = [...new Set([...g.imsis, ...selectedImsis])];
-                      await subscriberGroupsApi.update(g._id, { imsis: merged });
-                      await fetchGroups();
-                      clearSelection();
-                      toast.success(`Added to "${g.name}"`);
-                    }}
-                    className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-nms-surface-2 text-left"
-                  >
-                    <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: g.color ?? '#6366f1' }} />
-                    {g.name}
-                  </button>
-                ))}
-              </div>
-            </div>
+            <DropdownMenu
+              side="top"
+              menuClassName="min-w-40"
+              trigger={({ onClick }) => (
+                <button onClick={onClick} className="nms-btn-ghost text-xs flex items-center gap-1.5">
+                  Add to group <ChevronDown className="w-3 h-3" />
+                </button>
+              )}
+            >
+              {(close) => groups.map(g => (
+                <button
+                  key={g._id}
+                  onClick={async () => {
+                    const merged = [...new Set([...g.imsis, ...selectedImsis])];
+                    await subscriberGroupsApi.update(g._id, { imsis: merged });
+                    await fetchGroups();
+                    clearSelection();
+                    close();
+                    toast.success(`Added to "${g.name}"`);
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-nms-surface-2 text-left"
+                >
+                  <span className="w-2.5 h-2.5 rounded-full shrink-0" style={{ backgroundColor: g.color ?? '#6366f1' }} />
+                  {g.name}
+                </button>
+              ))}
+            </DropdownMenu>
+          )}
+          {/* Assign selected to a charging plan — same bulk-select pattern as
+              groups, not a separate flow. Reassignment (moving off whatever
+              plan a subscriber was already on) is handled server-side. */}
+          {FEATURES.ocs && plans.length > 0 && (
+            <DropdownMenu
+              side="top"
+              menuClassName="min-w-40"
+              trigger={({ onClick }) => (
+                <button onClick={onClick} className="nms-btn-ghost text-xs flex items-center gap-1.5">
+                  <Wallet className="w-3.5 h-3.5" /> Add to plan <ChevronDown className="w-3 h-3" />
+                </button>
+              )}
+            >
+              {(close) => plans.map(p => (
+                <button
+                  key={p._id}
+                  onClick={async () => {
+                    const imsis = [...selectedImsis];
+                    const result = await chargingPlansApi.assign(p._id, imsis);
+                    await fetchPlans();
+                    clearSelection();
+                    close();
+                    if (result.success) {
+                      toast.success(`Assigned to "${p.name}"${result.failed ? ` (${result.failed} failed)` : ''}`);
+                    } else {
+                      toast.error(result.error || 'Assign failed');
+                    }
+                  }}
+                  className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-nms-surface-2 text-left"
+                >
+                  <Wallet className="w-3 h-3 shrink-0 text-nms-accent" />
+                  {p.name}
+                </button>
+              ))}
+            </DropdownMenu>
           )}
           <div className="w-px h-4 bg-nms-border" />
           <button
@@ -3081,6 +3397,7 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
                 { key: 'ue_ipv4', label: 'UE IPv4' },
                 { key: null,      label: 'Status' },
                 { key: null,      label: 'Slices' },
+                ...(FEATURES.ocs ? [{ key: null, label: 'Plan' }] : []),
                 { key: null,      label: 'Actions' },
               ].map(({ key, label }) => (
                 <th key={label} className="text-left px-4 py-3 text-xs font-semibold text-nms-text-dim uppercase tracking-wider">
@@ -3194,24 +3511,58 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
                     </div>
                   </td>
                   <td className="px-4 py-3 text-xs">
-                    {sub.nickname
-                      ? <span className="text-nms-accent font-medium">{sub.nickname}</span>
-                      : <span className="text-nms-text-dim">—</span>}
+                    <InlineTextCell
+                      value={sub.nickname ?? ''}
+                      isAdmin={!isViewer}
+                      placeholder="Nickname"
+                      widthClass="w-28"
+                      onSave={(v) => saveNickname(sub.imsi, v)}
+                      renderDisplay={(v) => v
+                        ? <span className="text-nms-accent font-medium">{v}</span>
+                        : <span className="text-nms-text-dim">—</span>}
+                    />
                   </td>
                   <td className="px-4 py-3 font-mono text-xs text-nms-text-dim">
                     {sub.iccid || <span className="text-nms-text-dim">—</span>}
                   </td>
-                  <td className="px-4 py-3 text-xs text-nms-text-dim">{sub.msisdn?.join(', ') || '—'}</td>
+                  <td className="px-4 py-3 text-xs text-nms-text-dim">
+                    <InlineTextCell
+                      value={sub.msisdn?.join(', ') ?? ''}
+                      isAdmin={!isViewer}
+                      placeholder="15555551234, ..."
+                      mono
+                      widthClass="w-36"
+                      onSave={(v) => saveMsisdn(sub.imsi, v)}
+                    />
+                  </td>
                   <td className="px-4 py-3 text-xs font-mono text-nms-text-dim">
                     {sub.sessions && sub.sessions.length > 0
-                      ? sub.sessions.map((s, i) => <div key={i}>{s.apn || '—'}</div>)
+                      ? sub.sessions.map((s, i) => (
+                          <div key={i}>
+                            <InlineTextCell
+                              value={s.apn ?? ''}
+                              isAdmin={!isViewer}
+                              placeholder="internet"
+                              mono
+                              widthClass="w-28"
+                              onSave={(v) => saveSessionField(sub.imsi, i, 'name', v)}
+                            />
+                          </div>
+                        ))
                       : (sub.apn || '—')}
                   </td>
                   <td className="px-4 py-3 text-xs font-mono text-nms-accent">
                     {sub.sessions && sub.sessions.length > 0
                       ? sub.sessions.map((s, i) => (
                           <div key={i}>
-                            {s.ipv4 || '—'}
+                            <InlineTextCell
+                              value={s.ipv4 ?? ''}
+                              isAdmin={!isViewer}
+                              placeholder="10.45.0.2"
+                              mono
+                              widthClass="w-28"
+                              onSave={(v) => saveSessionField(sub.imsi, i, 'ipv4', v)}
+                            />
                             {s.framedRoutes && s.framedRoutes.length > 0 && (
                               <div className="text-nms-text-dim">↳ {s.framedRoutes.join(', ')}</div>
                             )}
@@ -3225,6 +3576,51 @@ export function SubscriberPage({ initialImsiToEdit }: SubscriberPageProps = {}):
                   <td className="px-4 py-3">
                     <span className="bg-nms-accent/10 text-nms-accent text-xs px-2 py-0.5 rounded-full">{sub.slice_count}</span>
                   </td>
+                  {FEATURES.ocs && (
+                    <td className="px-4 py-3">
+                      {isViewer ? (
+                        planByImsi.has(sub.imsi) ? (
+                          <span className="bg-nms-accent/10 text-nms-accent text-xs px-2 py-0.5 rounded-full flex items-center gap-1 w-fit">
+                            <Wallet className="w-2.5 h-2.5" /> {planByImsi.get(sub.imsi)!.name}
+                          </span>
+                        ) : (
+                          <span className="text-xs text-nms-text-dim">—</span>
+                        )
+                      ) : (
+                        <DropdownMenu
+                          menuClassName="min-w-36"
+                          trigger={({ onClick }) => planByImsi.has(sub.imsi) ? (
+                            <button onClick={onClick} className="bg-nms-accent/10 text-nms-accent text-xs px-2 py-0.5 rounded-full flex items-center gap-1 hover:bg-nms-accent/20">
+                              <Wallet className="w-2.5 h-2.5" /> {planByImsi.get(sub.imsi)!.name}
+                            </button>
+                          ) : (
+                            <button onClick={onClick} className="text-xs text-nms-text-dim border border-dashed border-nms-border px-2 py-0.5 rounded-full hover:text-nms-text hover:border-nms-text-dim">
+                              Set plan
+                            </button>
+                          )}
+                        >
+                          {(close) => plans.length === 0 ? (
+                            <div className="px-3 py-2 text-xs text-nms-text-dim whitespace-nowrap">No plans yet — create one on the Charging Plans page</div>
+                          ) : plans.map(p => (
+                            <button
+                              key={p._id}
+                              onClick={async () => {
+                                const result = await chargingPlansApi.assign(p._id, [sub.imsi]);
+                                await fetchPlans();
+                                close();
+                                if (result.success) toast.success(`Assigned "${sub.imsi}" to "${p.name}"`);
+                                else toast.error(result.error || 'Assign failed');
+                              }}
+                              className="w-full flex items-center gap-2 px-3 py-2 text-sm hover:bg-nms-surface-2 text-left whitespace-nowrap"
+                            >
+                              <Wallet className="w-3 h-3 shrink-0 text-nms-accent" />
+                              {p.name}
+                            </button>
+                          ))}
+                        </DropdownMenu>
+                      )}
+                    </td>
+                  )}
                   <td className="px-4 py-3 text-right">
                     {!isViewer && (
                       <div className="flex items-center justify-end gap-2">

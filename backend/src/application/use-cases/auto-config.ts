@@ -1,6 +1,6 @@
 import pino from 'pino';
 import { IHostExecutor } from '../../domain/interfaces/host-executor';
-import { IConfigRepository } from '../../domain/interfaces/config-repository';
+import { IConfigRepository, AllConfigs } from '../../domain/interfaces/config-repository';
 import { IAuditLogger } from '../../domain/interfaces/audit-logger';
 
 export interface PlmnConfig {
@@ -84,6 +84,79 @@ export interface AutoConfigPreviewResult {
   diffs: Record<string, string>; // service name -> diff string
 }
 
+// Ports AutoConfigPage.tsx's own "derive the current form state from loaded
+// configs" logic (its loadCurrentConfigs() effect) server-side, for the IP
+// Plan apply orchestrator — it needs a full, valid AutoConfigInput baseline
+// so it can flip just applyInterfaces/applyPfcp for whichever fields
+// actually changed while passing every other required field through
+// unchanged. Reads configRepo.loadAll()'s .rawYaml directly (the frontend's
+// own configApi.getAll() already unwraps that hop via ConfigMapper.toAllDto,
+// this does not) — same field paths, same loopback-prefix heuristics for
+// localUpfOnly/localSgwuOnly, kept in sync by comment cross-reference since
+// there's no shared-types package between the two.
+export function deriveCurrentAutoConfigInput(configs: AllConfigs): AutoConfigInput {
+  const mmeRaw = (configs.mme as any)?.rawYaml?.mme;
+  const amfRaw = (configs.amf as any)?.rawYaml?.amf;
+  const sgwuRaw = (configs.sgwu as any)?.rawYaml?.sgwu;
+  const upfRaw = (configs.upf as any)?.rawYaml?.upf;
+  const smfRaw = (configs.smf as any)?.rawYaml?.smf;
+  const sgwcRaw = (configs.sgwc as any)?.rawYaml?.sgwc;
+
+  const mmeGummeis: any[] = mmeRaw?.gummei || [];
+  const plmn4g: PlmnConfig[] = mmeGummeis.map((gummei: any) => {
+    const plmnId = Array.isArray(gummei.plmn_id) ? gummei.plmn_id[0] : gummei.plmn_id;
+    const tai = mmeRaw?.tai?.find((t: any) => {
+      const taiPlmn = Array.isArray(t.plmn_id) ? t.plmn_id[0] : t.plmn_id;
+      return taiPlmn?.mcc === plmnId?.mcc && taiPlmn?.mnc === plmnId?.mnc;
+    });
+    const tacValue = tai?.tac;
+    const tac = Array.isArray(tacValue) ? tacValue[0] : tacValue;
+    return { mcc: plmnId?.mcc || '999', mnc: plmnId?.mnc || '70', mme_gid: gummei.mme_gid || 2, mme_code: gummei.mme_code || 1, tac: tac || 1 };
+  });
+
+  const amfGuamis: any[] = amfRaw?.guami || [];
+  const plmn5g: PlmnConfig[] = amfGuamis.map((guami: any) => {
+    const plmnId = guami.plmn_id;
+    const tai = amfRaw?.tai?.find((t: any) => t.plmn_id?.mcc === plmnId?.mcc && t.plmn_id?.mnc === plmnId?.mnc);
+    return { mcc: plmnId?.mcc || '999', mnc: plmnId?.mnc || '70', tac: tai?.tac || 1 };
+  });
+
+  const smfUpfs: any[] = smfRaw?.pfcp?.client?.upf ?? [];
+  const hasRemoteUpf = smfUpfs.some((u: any) => u.address && !u.address.startsWith('127.'));
+  const sgwcSgwus: any[] = sgwcRaw?.pfcp?.client?.sgwu ?? [];
+  const hasRemoteSgwu = sgwcSgwus.some((u: any) => u.address && !u.address.startsWith('127.'));
+  const sgwcServers: any[] = sgwcRaw?.pfcp?.server ?? [];
+  const smfServers: any[] = smfRaw?.pfcp?.server ?? [];
+  const upfSessions: any[] = upfRaw?.session || [];
+
+  return {
+    applyPlmn: true, applyInterfaces: true, applyPfcp: true, applySessionPools: true,
+    plmn4g: plmn4g.length > 0 ? plmn4g : [{ mcc: '999', mnc: '70', mme_gid: 2, mme_code: 1, tac: 1 }],
+    plmn5g: plmn5g.length > 0 ? plmn5g : [{ mcc: '999', mnc: '70', tac: 1 }],
+    s1mmeIP: mmeRaw?.s1ap?.server?.[0]?.address || '',
+    s1mmeDev: mmeRaw?.s1ap?.server?.[0]?.dev || '',
+    sgwuGtpIP: sgwuRaw?.gtpu?.server?.[0]?.address || '',
+    amfNgapIP: amfRaw?.ngap?.server?.[0]?.address || '',
+    amfNgapDev: amfRaw?.ngap?.server?.[0]?.dev || '',
+    upfGtpIP: upfRaw?.gtpu?.server?.[0]?.address || '',
+    smfPfcpIP: smfServers.find((s: any) => !s.address?.startsWith('127.'))?.address || smfServers[0]?.address || '',
+    localUpfPfcpIP: upfRaw?.pfcp?.server?.[0]?.address || '',
+    localUpfOnly: !hasRemoteUpf,
+    localSgwuOnly: !hasRemoteSgwu,
+    sgwcPfcpIP: sgwcServers.find((s: any) => !s.address?.startsWith('127.'))?.address || '',
+    remoteSgwus: sgwcSgwus
+      .filter((u: any) => u.address && !u.address.startsWith('127.'))
+      .map((u: any) => ({ pfcpIP: u.address, gtpuIP: '', tac: u.tac ? (Array.isArray(u.tac) ? u.tac : [u.tac]) : [], label: '' })),
+    sessionPools: upfSessions.length > 0
+      ? upfSessions.map((s: any) => ({ subnet: s.subnet || '', gateway: s.gateway || '', dnn: s.dnn || '', dev: s.dev || '' }))
+      : [
+          { subnet: '10.45.0.0/16', gateway: '10.45.0.1', dnn: '', dev: '' },
+          { subnet: '2001:db8:cafe::/48', gateway: '2001:db8:cafe::1', dnn: '', dev: '' },
+        ],
+    configureNAT: false,
+    natInterface: 'ogstun',
+  };
+}
 
 // ── Helper: build a deduplicated PFCP server list ──────────────────────────
 // Merges existing servers with a new address, ensuring no duplicate IPs.

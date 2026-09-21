@@ -350,7 +350,7 @@ export class ModuleFixAllUseCase {
         if (status.configStale) {
           const saved = readPstnState();
           result.ranConfigure = true;
-          const r = await configurePstn({ asteriskIp: saved?.asteriskIp ?? '' }, this.mongoUri);
+          const r = await configurePstn({ asteriskIp: saved?.asteriskIp ?? '' }, this.mongoUri, this.subscriberRepo, this.hostExecutor);
           result.configureSuccess = r.success;
           if (!r.success) result.error = r.error;
         }

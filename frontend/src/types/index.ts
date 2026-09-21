@@ -1,5 +1,17 @@
 // ── Service Types ──
-export type ServiceName = 'nrf' | 'scp' | 'amf' | 'smf' | 'upf' | 'ausf' | 'udm' | 'udr' | 'pcf' | 'nssf' | 'bsf' | 'mme' | 'hss' | 'pcrf' | 'sgwc' | 'sgwu';
+// Mirrors backend/src/domain/entities/service-status.ts's own ServiceName
+// union — keep these two in sync. This one had drifted badly out of date
+// (missing mongodb, sepp1, and every Osmocom/HNBGW/OCS entry added since);
+// caught live when a direct `s.name === 'ocs'` comparison failed to
+// typecheck with "no overlap" even though the real backend can send it.
+export type ServiceName =
+  | 'mongodb'
+  | 'nrf' | 'scp' | 'amf' | 'smf' | 'upf' | 'ausf' | 'udm' | 'udr' | 'pcf' | 'nssf' | 'bsf' | 'sepp1'
+  | 'mme' | 'hss' | 'pcrf' | 'sgwc' | 'sgwu'
+  | 'osmo-stp' | 'osmo-hlr' | 'osmo-msc'
+  | 'osmo-bsc' | 'osmo-mgw' | 'osmo-bts-virtual' | 'osmo-pcu' | 'osmo-sgsn' | 'osmo-ggsn' | 'osmo-meas-udp2db' | 'osmo-sip-connector'
+  | 'osmo-hnbgw' | 'osmo-mgw-hnbgw'
+  | 'ocs';
 
 export interface ServiceStatus {
   name: ServiceName;

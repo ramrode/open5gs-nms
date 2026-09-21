@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react';
-import { Activity, Users, Wifi, AlertTriangle, Play, Square, Zap, Clock, Radio, Shield, ShieldCheck, ShieldOff, Globe, PhoneCall, Phone, MessageSquare, Smartphone } from 'lucide-react';
+import { useCallback, useEffect, useState } from 'react';
+import { clsx } from 'clsx';
+import { Activity, Users, Wifi, AlertTriangle, Play, Square, Zap, Clock, Radio, Shield, ShieldCheck, ShieldOff, Globe, PhoneCall, Phone, MessageSquare, Smartphone, Lock } from 'lucide-react';
 import { useServiceStore, useSubscriberStore } from '../../stores';
-import { configApi, serviceApi, interfaceApi, radioBlockApi } from '../../api';
+import { configApi, serviceApi, interfaceApi, radioBlockApi, gnbBlockApi, hnbBlockApi } from '../../api';
 import { ConfirmModal } from '../common/ConfirmModal';
 import { sasApi } from '../../api/sas';
 import { imsApi, type ImsStatus, type ImsCallStats } from '../../api/ims';
@@ -102,6 +103,7 @@ const SERVICES_OSMO = [
 ];
 function vendorLabel(serviceName: string): string {
   if (serviceName === 'mongodb') return 'MongoDB';
+  if (serviceName === 'ocs') return 'SigScale';
   if (SERVICES_OSMO.includes(serviceName)) return 'Osmocom';
   return 'Open5GS';
 }
@@ -146,6 +148,31 @@ function AddonServiceMiniCard({ name, vendor, active, loading }: { name: string;
         {loading ? '…' : active ? 'active' : 'inactive'}
       </span>
     </div>
+  );
+}
+
+// One of the 5 header kill-switch buttons (Block RAN / 2G / 3G / 4G / 5G).
+// Doubles as the unblock-all action once count > 0 — flashes red
+// (animate-flash-red, the same utility RANPage.tsx/SubscriberPage.tsx
+// already use for an individual blocked radio/UE's own row) as a standing
+// alarm until every radio of that generation is unblocked, same as clicking
+// Unblock directly on the RAN page would clear it.
+function BlockGenButton({ icon: Icon, label, count, disabled, blockTitle, unblockTitle, onBlock, onUnblock }: {
+  icon: React.ComponentType<{ className?: string }>;
+  label: string; count: number; disabled: boolean;
+  blockTitle: string; unblockTitle: string;
+  onBlock: () => void; onUnblock: () => void;
+}): JSX.Element {
+  const isBlocked = count > 0;
+  return (
+    <button
+      onClick={isBlocked ? onUnblock : onBlock}
+      disabled={disabled}
+      className={clsx('nms-btn-danger text-xs flex items-center gap-1.5 px-2.5 py-1.5', isBlocked && 'animate-flash-red')}
+      title={isBlocked ? unblockTitle : blockTitle}
+    >
+      <Icon className="w-3 h-3" /> {isBlocked ? `${label} Blocked (${count})` : `Block ${label}`}
+    </button>
   );
 }
 
@@ -333,22 +360,139 @@ export function DashboardPage(): JSX.Element {
     }
   };
 
-  // "Block RAN" kill switch — severs S1-MME/S1-U (nftables, this host only) for every
-  // currently connected 4G eNodeB at once, without touching any radio's own config. Same
-  // mechanism as the per-radio Block button on the RAN page — see radio-block-service.ts.
-  const [confirmBlockRan, setConfirmBlockRan] = useState(false);
-  const [blockingRan, setBlockingRan] = useState(false);
-  const doBlockAllRadios = async (): Promise<void> => {
-    setBlockingRan(true);
+  // "Block RAN" kill switch — bulk-blocks every currently connected radio,
+  // across all four generations at once, each via its own generation's own
+  // mechanism: 3G/4G/5G sever their radio-facing paths to the core via
+  // nftables (this host only, radio itself untouched — radio-block-service.ts
+  // /gnb-block-service.ts/hnb-block-service.ts). 2G is genuinely different —
+  // it reuses the same real osmo-bsc OML admin-lock as the per-BTS Block
+  // button on the RAN page (see Gsm2GBlockButton's own comment there for why
+  // that's deliberately never visually conflated with the mild nftables
+  // block), which drops camped UEs immediately and takes each BTS off the
+  // air. "Block 2G/3G/4G/5G" below are the same four calls individually, for
+  // an operator who only wants to cut one generation.
+  type BlockGen = '2g' | '3g' | '4g' | '5g' | 'all';
+  const BLOCK_GEN_LABEL: Record<BlockGen, string> = { '2g': '2G', '3g': '3G', '4g': '4G', '5g': '5G', all: 'RAN' };
+  const BLOCK_GEN_CONFIRM: Record<BlockGen, { title: string; message: string }> = {
+    all: {
+      title: 'Block RAN?',
+      message: "This immediately blocks every currently connected radio across all four generations. 3G/4G/5G are severed at this host only (nftables — no radio config touched, Iuh/S1-MME+S1-U/N2+N3 paths cut). 2G is different: it locks every configured BTS at osmo-bsc itself, which drops any camped UEs immediately and takes each one off the air. Each generation can be restored individually from its own page, or unblocked here.",
+    },
+    '2g': {
+      title: 'Block 2G?',
+      message: 'This administratively locks every configured BTS at osmo-bsc — real hardware, not a host-only network rule. Any camped UEs drop immediately and each BTS stops broadcasting until unlocked from the RAN page.',
+    },
+    '3g': {
+      title: 'Block 3G?',
+      message: 'This immediately severs Iuh for every currently registered HNB (nftables, this host only) — no HNB config is touched, and each one can be restored from the RAN page.',
+    },
+    '4g': {
+      title: 'Block 4G?',
+      message: "This immediately severs S1-MME and S1-U for every currently connected eNodeB (nftables, this host only) — no radio config is touched, and each one can be restored from the RAN page.",
+    },
+    '5g': {
+      title: 'Block 5G?',
+      message: 'This immediately severs N2 and N3 for every currently connected gNodeB (nftables, this host only) — no radio config is touched, and each one can be restored from the RAN page.',
+    },
+  };
+  const [confirmBlockGen, setConfirmBlockGen] = useState<BlockGen | null>(null);
+  const [blockingGen, setBlockingGen] = useState<BlockGen | null>(null);
+  const doBlockGeneration = async (gen: BlockGen): Promise<void> => {
+    setBlockingGen(gen);
     try {
-      const { ips } = await radioBlockApi.blockAll();
-      toast.success(ips.length > 0 ? `Blocked ${ips.length} radio${ips.length === 1 ? '' : 's'}` : 'No radios currently connected to block');
+      if (gen === 'all') {
+        const [r4, r5, r2, r3] = await Promise.allSettled([
+          radioBlockApi.blockAll(),
+          gnbBlockApi.blockAll(),
+          gsmApi.blockAllBts(),
+          hnbBlockApi.blockAll(),
+        ]);
+        const n4 = r4.status === 'fulfilled' ? r4.value.ips.length : 0;
+        const n5 = r5.status === 'fulfilled' ? r5.value.ips.length : 0;
+        const n2 = r2.status === 'fulfilled' ? r2.value.results.filter(x => x.success).length : 0;
+        const n3 = r3.status === 'fulfilled' ? r3.value.ips.length : 0;
+        const anyFailed = [r4, r5, r2, r3].some(r => r.status === 'rejected');
+        const total = n2 + n3 + n4 + n5;
+        const summary = `2G:${n2} 3G:${n3} 4G:${n4} 5G:${n5}`;
+        if (anyFailed) toast.error(`Blocked ${total} radio${total === 1 ? '' : 's'} (${summary}) — one or more generations failed, check individually`);
+        else toast.success(total > 0 ? `Blocked ${total} radio${total === 1 ? '' : 's'} (${summary})` : 'No radios currently connected to block');
+      } else if (gen === '2g') {
+        const { results } = await gsmApi.blockAllBts();
+        const okCount = results.filter(r => r.success).length;
+        const failed = results.filter(r => !r.success);
+        if (failed.length > 0) toast.error(`Blocked ${okCount}, failed ${failed.length} (${failed.map(f => f.name).join(', ')})`);
+        else toast.success(okCount > 0 ? `Blocked ${okCount} BTS${okCount === 1 ? '' : 's'}` : 'No BTS configured to block');
+      } else {
+        const api = gen === '3g' ? hnbBlockApi : gen === '4g' ? radioBlockApi : gnbBlockApi;
+        const { ips } = await api.blockAll();
+        toast.success(ips.length > 0 ? `Blocked ${ips.length} radio${ips.length === 1 ? '' : 's'}` : `No ${BLOCK_GEN_LABEL[gen]} radios currently connected to block`);
+      }
     } catch (err) {
-      toast.error('Failed to block RAN');
+      toast.error(`Failed to block ${BLOCK_GEN_LABEL[gen]}`);
     } finally {
-      setBlockingRan(false);
+      setBlockingGen(null);
+      fetchBlockedCounts();
     }
   };
+
+  // Per-generation "is anything currently blocked" counts — drive the
+  // flash-red alarm state on the buttons below (animate-flash-red, the same
+  // utility RANPage.tsx/SubscriberPage.tsx already use for a blocked radio's
+  // own row) and let the same button double as the unblock-all action once
+  // blocked, since there's no separate bulk-unblock button anywhere else.
+  const [blocked2G, setBlocked2G] = useState(0);
+  const [blocked3G, setBlocked3G] = useState(0);
+  const [blocked4G, setBlocked4G] = useState(0);
+  const [blocked5G, setBlocked5G] = useState(0);
+  const BLOCKED_COUNT: Record<BlockGen, number> = {
+    '2g': blocked2G, '3g': blocked3G, '4g': blocked4G, '5g': blocked5G,
+    all: blocked2G + blocked3G + blocked4G + blocked5G,
+  };
+  const fetchBlockedCounts = useCallback(() => {
+    radioBlockApi.getAll().then(l => setBlocked4G(l.length)).catch(() => {});
+    gnbBlockApi.getAll().then(l => setBlocked5G(l.length)).catch(() => {});
+    hnbBlockApi.getAll().then(l => setBlocked3G(l.length)).catch(() => {});
+    gsmApi.listBts().then(r => setBlocked2G(r.btsEntries.filter(e => e.blocked).length)).catch(() => {});
+  }, []);
+
+  const doUnblockGeneration = async (gen: BlockGen): Promise<void> => {
+    setBlockingGen(gen);
+    try {
+      if (gen === 'all') {
+        const [r4, r5, r3] = await Promise.allSettled([
+          radioBlockApi.getAll().then(l => Promise.allSettled(l.map(b => radioBlockApi.unblock(b.ip)))),
+          gnbBlockApi.getAll().then(l => Promise.allSettled(l.map(b => gnbBlockApi.unblock(b.ip)))),
+          hnbBlockApi.getAll().then(l => Promise.allSettled(l.map(b => hnbBlockApi.unblock(b.ip)))),
+        ]);
+        const { btsEntries } = await gsmApi.listBts();
+        const r2 = await Promise.allSettled(btsEntries.filter(e => e.blocked).map(e => gsmApi.unblockBts(e.id)));
+        const anyFailed = [r4, r5, r3].some(r => r.status === 'rejected') || r2.some(r => r.status === 'rejected');
+        toast[anyFailed ? 'error' : 'success'](anyFailed ? 'Unblocked most radios — one or more generations failed, check individually' : 'Unblocked all radios');
+      } else if (gen === '2g') {
+        const { btsEntries } = await gsmApi.listBts();
+        const blocked = btsEntries.filter(e => e.blocked);
+        const results = await Promise.allSettled(blocked.map(e => gsmApi.unblockBts(e.id)));
+        const okCount = results.filter(r => r.status === 'fulfilled').length;
+        toast.success(okCount > 0 ? `Unblocked ${okCount} BTS${okCount === 1 ? '' : 's'}` : 'No BTS currently blocked');
+      } else {
+        const api = gen === '3g' ? hnbBlockApi : gen === '4g' ? radioBlockApi : gnbBlockApi;
+        const list = await api.getAll();
+        await Promise.allSettled(list.map(b => api.unblock(b.ip)));
+        toast.success(list.length > 0 ? `Unblocked ${list.length} radio${list.length === 1 ? '' : 's'}` : `No ${BLOCK_GEN_LABEL[gen]} radios currently blocked`);
+      }
+    } catch (err) {
+      toast.error(`Failed to unblock ${BLOCK_GEN_LABEL[gen]}`);
+    } finally {
+      setBlockingGen(null);
+      fetchBlockedCounts();
+    }
+  };
+
+  useEffect(() => {
+    fetchBlockedCounts();
+    const iv = setInterval(fetchBlockedCounts, 5000);
+    return () => clearInterval(iv);
+  }, [fetchBlockedCounts]);
 
   return (
     <div className="p-6 space-y-6">
@@ -380,14 +524,37 @@ export function DashboardPage(): JSX.Element {
           >
             <Zap className="w-3 h-3" /> Restart All
           </button>
-          <button
-            onClick={() => setConfirmBlockRan(true)}
-            disabled={blockingRan}
-            className="nms-btn-danger text-xs flex items-center gap-1.5 px-2.5 py-1.5"
-            title="Sever S1-MME and S1-U for every connected radio (nftables, this host only) — radios themselves are not touched"
-          >
-            <ShieldOff className="w-3 h-3" /> Block RAN
-          </button>
+          <div className="h-5 w-px bg-nms-border" />
+          <BlockGenButton
+            icon={ShieldOff} label="RAN" count={BLOCKED_COUNT.all} disabled={blockingGen !== null}
+            blockTitle="Block every currently connected radio across all generations (2G/3G/4G/5G)"
+            unblockTitle="Unblock every currently blocked radio across all generations"
+            onBlock={() => setConfirmBlockGen('all')} onUnblock={() => doUnblockGeneration('all')}
+          />
+          <BlockGenButton
+            icon={Lock} label="2G" count={BLOCKED_COUNT['2g']} disabled={blockingGen !== null}
+            blockTitle="Lock every configured 2G BTS at osmo-bsc — drops camped UEs immediately, real device impact (not a mild host-only rule like 3G/4G/5G)"
+            unblockTitle="Unlock every currently blocked 2G BTS at osmo-bsc"
+            onBlock={() => setConfirmBlockGen('2g')} onUnblock={() => doUnblockGeneration('2g')}
+          />
+          <BlockGenButton
+            icon={ShieldOff} label="3G" count={BLOCKED_COUNT['3g']} disabled={blockingGen !== null}
+            blockTitle="Sever Iuh for every connected 3G HNB (nftables, this host only) — HNBs themselves are not touched"
+            unblockTitle="Restore Iuh for every currently blocked 3G HNB"
+            onBlock={() => setConfirmBlockGen('3g')} onUnblock={() => doUnblockGeneration('3g')}
+          />
+          <BlockGenButton
+            icon={ShieldOff} label="4G" count={BLOCKED_COUNT['4g']} disabled={blockingGen !== null}
+            blockTitle="Sever S1-MME and S1-U for every connected 4G eNodeB (nftables, this host only) — radios themselves are not touched"
+            unblockTitle="Restore S1-MME and S1-U for every currently blocked 4G eNodeB"
+            onBlock={() => setConfirmBlockGen('4g')} onUnblock={() => doUnblockGeneration('4g')}
+          />
+          <BlockGenButton
+            icon={ShieldOff} label="5G" count={BLOCKED_COUNT['5g']} disabled={blockingGen !== null}
+            blockTitle="Sever N2 and N3 for every connected 5G gNodeB (nftables, this host only) — radios themselves are not touched"
+            unblockTitle="Restore N2 and N3 for every currently blocked 5G gNodeB"
+            onBlock={() => setConfirmBlockGen('5g')} onUnblock={() => doUnblockGeneration('5g')}
+          />
         </div>
       </div>
 
@@ -748,6 +915,7 @@ export function DashboardPage(): JSX.Element {
             </div>
           </div>
         </div>
+
       </div>
 
       {/* Service Status Table */}
@@ -817,13 +985,13 @@ export function DashboardPage(): JSX.Element {
       )}
 
       <ConfirmModal
-        open={confirmBlockRan}
-        title="Block RAN?"
-        message="This immediately severs S1-MME and S1-U for every currently connected radio (nftables, this host only) — no radio's own config is touched, and each one can be restored individually from the RAN page, or all at once by unblocking them there."
-        confirmLabel="Block RAN"
+        open={confirmBlockGen !== null}
+        title={confirmBlockGen ? BLOCK_GEN_CONFIRM[confirmBlockGen].title : ''}
+        message={confirmBlockGen ? BLOCK_GEN_CONFIRM[confirmBlockGen].message : ''}
+        confirmLabel={confirmBlockGen ? `Block ${BLOCK_GEN_LABEL[confirmBlockGen]}` : ''}
         danger
-        onConfirm={() => { setConfirmBlockRan(false); doBlockAllRadios(); }}
-        onCancel={() => setConfirmBlockRan(false)}
+        onConfirm={() => { const gen = confirmBlockGen!; setConfirmBlockGen(null); doBlockGeneration(gen); }}
+        onCancel={() => setConfirmBlockGen(null)}
       />
     </div>
   );

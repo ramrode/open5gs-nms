@@ -2,12 +2,14 @@ import { useState, useEffect, useCallback, useRef } from 'react';
 import Editor from '@monaco-editor/react';
 import {
   Phone, CheckCircle, XCircle, AlertCircle, RefreshCw,
-  Terminal, RotateCw, Settings, Power, BookOpen, ChevronDown, Plus, Trash2, PhoneCall, FileText, Signal, ArrowRight,
+  Terminal, RotateCw, Settings, Power, BookOpen, ChevronDown, Plus, Trash2, PhoneCall, PhoneIncoming, PhoneOutgoing, FileText, Signal, ArrowRight,
+  Pencil, Check, X,
 } from 'lucide-react';
 import { clsx } from 'clsx';
 import toast from 'react-hot-toast';
 import { pstnApi } from '../api/pstn';
-import type { PstnStatus, PstnExtension } from '../api/pstn';
+import { ipPlanApi } from '../api/ip-plan';
+import type { PstnStatus, PstnExtension, DidMapping, OutboundCallerId } from '../api/pstn';
 import { asterisk2gApi } from '../api/asterisk-2g';
 import type { Asterisk2gStatus, Asterisk2gExtension } from '../api/asterisk-2g';
 import { gsmApi } from '../api/gsm';
@@ -44,7 +46,7 @@ function OverviewCard() {
       <button onClick={() => setOpen(o => !o)} className="w-full flex items-center justify-between gap-3 text-left">
         <div className="flex items-center gap-2">
           <BookOpen className="w-4 h-4 text-nms-accent shrink-0" />
-          <span className="text-sm font-semibold text-nms-text">How the PSTN Gateway Works</span>
+          <span className="text-sm font-semibold text-nms-text">How the Voice Gateway Works</span>
           <span className="text-xs text-nms-text-dim">— architecture overview</span>
         </div>
         <ChevronDown className={clsx('w-4 h-4 text-nms-text-dim transition-transform shrink-0', open && 'rotate-180')} />
@@ -56,13 +58,17 @@ function OverviewCard() {
             <p className="text-nms-text-dim leading-relaxed">
               Kamailio's S-CSCF already has BGCF/MGCF-style PSTN breakout routing built in
               (a Kamailio <span className="text-nms-text font-medium">dispatcher</span> group that
-              catches any dialed number that looks like a real phone number and isn't a local
-              subscriber). This module wires <span className="text-nms-text font-medium">Asterisk</span>{' '}
-              into that dispatcher as the gateway — Asterisk handles the AMR-WB↔G.711 transcoding
-              real VoLTE calls need, and either bridges to a real SIP trunk provider (once you have
-              one configured) or, for internal testing, looks up the dialed number in the extension
-              table below and calls the mapped subscriber directly back through the core.
+              catches any dialed number that isn't a currently-registered local subscriber). This
+              module wires <span className="text-nms-text font-medium">Asterisk</span> into that
+              dispatcher as the gateway — Asterisk handles the AMR-WB/AMR↔G.711 transcoding real
+              VoLTE and 2G calls need, and now supports three distinct call paths, all through this
+              same Asterisk instance:
             </p>
+            <ul className="mt-3 space-y-1.5 text-xs text-nms-text-dim">
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Internal short codes / MSISDN dialing</span> — looks up the dialed number in the extension table below (or a subscriber's own real MSISDN) and calls the mapped subscriber back through the core. Good for proving the signaling path end-to-end without any external dependency.</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Cross-RAN Calling</span> — a second, fully isolated Asterisk instance (Asterisk-2G) peers directly with this one, so a 4G/5G short code can reach a 2G subscriber and vice versa, with automatic transcoding between the two RANs' native codecs.</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Real external SIP trunk + DID/caller-ID mapping</span> — a genuine off-host trunk to a third-party SIP provider, with two independently-assignable mappings. Inbound: real numbers (DIDs) are mapped to any subscriber on any RAN tech (2G/4G/5G) — the network auto-detects which RAN to route to, no manual selection needed; a subscriber can have several DIDs. Outbound (4G/5G only so far): any dialed number that isn't a known subscriber MSISDN or internal short code is sent to the trunk — a subscriber with an outbound caller ID assigned presents that (some providers only route calls whose caller ID matches a number they recognize), everyone else presents their real MSISDN.</span></li>
+            </ul>
           </div>
           <div>
             <h3 className="text-xs font-semibold text-nms-text uppercase tracking-wider mb-3">Signal path (internal extension test)</h3>
@@ -89,10 +95,11 @@ function OverviewCard() {
           <div>
             <h3 className="text-xs font-semibold text-nms-text uppercase tracking-wider mb-2">Important notes</h3>
             <ul className="space-y-1.5 text-xs text-nms-text-dim">
-              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">No real SIP trunk provider yet:</span> this module only wires the internal extension-to-subscriber path. Connecting to a real provider (Twilio, Telnyx, etc.) for actual outside calls is a separate, not-yet-built step.</span></li>
-              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Any digits, any length, no "+" needed</span> — S-CSCF routes a dialed number to the PSTN gateway whenever it ISN'T a currently-registered subscriber, not based on the number's format. Pick whatever extension scheme you like (e.g. short 4-digit codes).</span></li>
-              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Don't reuse a real subscriber's own number as an extension</span> — if that subscriber ever registers, S-CSCF would find them directly and never reach the dispatcher/Asterisk at all for that number.</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">The external trunk mechanism is built and tested, not yet pointed at a live provider on this deployment</span> — the SIP transport, firewall allowlist, DID routing, and outbound classification all work end-to-end against test values. Pointing the trunk at a real provider (bind IP, provider host/CIDR) is a deliberate, separate step from the <strong>External SIP Trunk</strong> card below.</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Any digits, any length, no "+" needed</span> — S-CSCF routes a dialed number to the Voice Gateway whenever it ISN'T a currently-registered subscriber, not based on the number's format. Pick whatever extension scheme you like (e.g. short 4-digit codes).</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Don't reuse a real subscriber's own number as an extension or DID</span> — if that subscriber ever registers, S-CSCF would find them directly and never reach the dispatcher/Asterisk at all for that number.</span></li>
               <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Real subscribers only</span> — dialing an extension mapped to a subscriber who isn't currently registered gets a normal "404 Not Found," exactly like calling an offline subscriber directly would.</span></li>
+              <li className="flex items-start gap-2"><span className="text-nms-accent mt-0.5">•</span><span><span className="text-nms-text font-medium">Inbound DID and outbound caller ID are independent</span> — mapping a DID to ring a subscriber does not, by itself, change what caller ID they present outbound (confirmed live 2026-09-19 that real operators need both set separately, e.g. several inbound DIDs ringing one subscriber but one specific number presented outbound). Set each one on its own card below; a subscriber with no outbound caller ID assigned still dials out fine, presenting their real MSISDN instead.</span></li>
             </ul>
           </div>
         </div>
@@ -241,6 +248,432 @@ function ExtensionsCard({ imsConfigured }: { imsConfigured: boolean }) {
   );
 }
 
+// Real external DID <-> subscriber, used both directions (inbound routing,
+// outbound caller-ID substitution — see pstn-controller.ts's
+// syncSubscriberDidLookupTable()). Direct copy of
+// ExtensionsCard's shape (inline form + table, no modal, no confirm-on-
+// delete — matches this project's established convention for a 1:1
+// mapping CRUD list). The RAN-path column is read-only/informational —
+// there's no manual "which path" field to set: routing is auto-derived
+// from the target subscriber's own gsmEnabled flag at dialplan-generation
+// time (see resolveAutoDialEntries()'s twin in pstn-controller.ts,
+// externalInboundDialplanConf(), landing in Phase 4).
+function DidMappingsCard({ imsConfigured }: { imsConfigured: boolean }) {
+  const [mappings, setMappings] = useState<DidMapping[]>([]);
+  const [subscribers, setSubscribers] = useState<SubscriberListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [newDid, setNewDid] = useState('');
+  const [newImsi, setNewImsi] = useState('');
+  const [newLabel, setNewLabel] = useState('');
+
+  // Inline row editor — editingDid tracks which row's key is being edited
+  // (not necessarily still its own value, since the DID itself is editable
+  // too); edit* holds that row's in-progress field values.
+  const [editingDid, setEditingDid] = useState<string | null>(null);
+  const [editDid, setEditDid] = useState('');
+  const [editImsi, setEditImsi] = useState('');
+  const [editLabel, setEditLabel] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [didRes, subRes] = await Promise.all([
+        pstnApi.listDidMappings(),
+        subscriberApi.list(0, 500),
+      ]);
+      setMappings(didRes.didMappings);
+      setSubscribers(subRes.subscribers);
+    } catch { /* ignore */ }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleAdd = async () => {
+    if (!newDid || !newImsi) return;
+    setAdding(true);
+    try {
+      await pstnApi.addDidMapping(newDid, newImsi, newLabel || undefined);
+      toast.success(`${newDid} mapped`);
+      setNewDid(''); setNewImsi(''); setNewLabel('');
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleRemove = async (did: string) => {
+    try {
+      await pstnApi.removeDidMapping(did);
+      toast.success(`${did} removed`);
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    }
+  };
+
+  const startEdit = (m: DidMapping) => {
+    setEditingDid(m.did); setEditDid(m.did); setEditImsi(m.subscriberImsi); setEditLabel(m.label ?? '');
+  };
+  const cancelEdit = () => setEditingDid(null);
+  const saveEdit = async () => {
+    if (!editingDid || !editDid || !editImsi) return;
+    setSavingEdit(true);
+    try {
+      await pstnApi.updateDidMapping(editingDid, editDid, editImsi, editLabel || undefined);
+      toast.success(`${editDid} updated`);
+      setEditingDid(null);
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  return (
+    <div className="nms-card">
+      <h2 className="text-sm font-semibold text-nms-text flex items-center gap-2 mb-1">
+        <PhoneIncoming className="w-4 h-4 text-nms-accent" /> Inbound DID Mapping
+      </h2>
+      <p className="text-xs text-nms-text-dim mb-4">
+        Map a real external DID (a number on your real SIP trunk) to a subscriber on any RAN
+        tech — inbound-only, unrelated to the short codes above. A subscriber can have several
+        DIDs mapped to them; to control what caller ID that subscriber presents on outbound
+        calls, use Outbound Caller ID below instead — the two are set independently.
+      </p>
+
+      {!imsConfigured ? (
+        <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2">
+          Configure IMS before assigning DID mappings — the dialplan needs the IMS domain.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+            <div>
+              <label className="nms-label">DID</label>
+              <input value={newDid} onChange={e => setNewDid(e.target.value)}
+                placeholder="15555551234" className="nms-input font-mono text-xs mt-1" />
+              <p className="text-xs text-nms-text-dim mt-1">Any digits, any length — no "+" needed</p>
+            </div>
+            <div>
+              <label className="nms-label">Subscriber</label>
+              <select value={newImsi} onChange={e => setNewImsi(e.target.value)} className="nms-input text-xs mt-1">
+                <option value="">Select subscriber…</option>
+                {subscribers.map(s => (
+                  <option key={s.imsi} value={s.imsi}>
+                    {s.nickname ? `${s.nickname} (${s.imsi})` : s.imsi}{s.msisdn?.[0] ? ` — ${s.msisdn[0]}` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="nms-label">Label <span className="text-nms-text-dim font-normal">(optional)</span></label>
+              <input value={newLabel} onChange={e => setNewLabel(e.target.value)}
+                placeholder="e.g. Main Office Line" className="nms-input text-xs mt-1" />
+            </div>
+            <div className="flex items-end">
+              <button onClick={handleAdd} disabled={adding || !newDid || !newImsi}
+                className="nms-btn-primary flex items-center gap-2 text-sm w-full justify-center">
+                <Plus className="w-4 h-4" /> {adding ? 'Adding…' : 'Add'}
+              </button>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="flex items-center justify-center py-6 text-nms-text-dim text-sm">
+              <RefreshCw className="w-4 h-4 animate-spin mr-2" /> Loading…
+            </div>
+          ) : mappings.length === 0 ? (
+            <p className="text-xs text-nms-text-dim text-center py-6">No DID mappings assigned yet.</p>
+          ) : (
+            <div className="border border-nms-border rounded-lg overflow-hidden">
+              <table className="w-full text-xs">
+                <thead className="bg-nms-surface-2 text-nms-text-dim">
+                  <tr>
+                    <th className="text-left px-3 py-2 font-medium">DID</th>
+                    <th className="text-left px-3 py-2 font-medium">Subscriber</th>
+                    <th className="text-left px-3 py-2 font-medium">Routes via</th>
+                    <th className="text-left px-3 py-2 font-medium">Label</th>
+                    <th className="px-3 py-2"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {mappings.map(m => editingDid === m.did ? (
+                    <tr key={m.did} className="border-t border-nms-border bg-nms-accent/5">
+                      <td className="px-3 py-1.5">
+                        <input autoFocus value={editDid} onChange={e => setEditDid(e.target.value)}
+                          className="nms-input font-mono text-xs py-1 px-1.5 h-7 w-28" />
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <select value={editImsi} onChange={e => setEditImsi(e.target.value)} className="nms-input text-xs py-1 h-7">
+                          {subscribers.map(s => (
+                            <option key={s.imsi} value={s.imsi}>
+                              {s.nickname ? `${s.nickname} (${s.imsi})` : s.imsi}{s.msisdn?.[0] ? ` — ${s.msisdn[0]}` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-3 py-1.5 text-nms-text-dim">—</td>
+                      <td className="px-3 py-1.5">
+                        <input value={editLabel} onChange={e => setEditLabel(e.target.value)}
+                          className="nms-input text-xs py-1 px-1.5 h-7 w-full" placeholder="Label" />
+                      </td>
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        <button onClick={saveEdit} disabled={savingEdit || !editDid || !editImsi} className="text-nms-green hover:text-nms-green/80 disabled:opacity-50 mr-2">
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={cancelEdit} disabled={savingEdit} className="text-nms-text-dim hover:text-nms-text">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={m.did} className="border-t border-nms-border group/row">
+                      <td className="px-3 py-2 font-mono text-nms-text">{m.did}</td>
+                      <td className="px-3 py-2 text-nms-text-dim">
+                        {m.subscriberNickname ? `${m.subscriberNickname} ` : ''}
+                        <span className="font-mono">{m.subscriberImsi}</span>
+                        {m.subscriberMsisdn ? ` (${m.subscriberMsisdn})` : ''}
+                      </td>
+                      <td className="px-3 py-2 text-nms-text-dim">{m.subscriberGsmEnabled ? '2G' : 'IMS (4G/5G)'}</td>
+                      <td className="px-3 py-2 text-nms-text-dim">{m.label ?? '—'}</td>
+                      <td className="px-3 py-2 text-right whitespace-nowrap">
+                        <button onClick={() => startEdit(m)} disabled={!!editingDid}
+                          className="text-nms-text-dim opacity-0 group-hover/row:opacity-100 hover:text-nms-accent transition-opacity mr-2 disabled:opacity-0">
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={() => handleRemove(m.did)} disabled={!!editingDid} className="text-red-400 hover:text-red-300 disabled:opacity-30">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// The outbound counterpart to DidMappingsCard above — deliberately a
+// separate collection/card, not a column on the same table, since a
+// subscriber's inbound DID(s) and outbound caller ID are independent facts
+// (see OutboundCallerId's own comment in pstn-controller.ts for the real
+// operator need that drove this split). One entry per subscriber — setting
+// a new value for a subscriber that already has one replaces it rather than
+// adding a second row, so this card's "Add" also serves as "Edit".
+function OutboundCallerIdCard({ imsConfigured }: { imsConfigured: boolean }) {
+  const [entries, setEntries] = useState<OutboundCallerId[]>([]);
+  const [subscribers, setSubscribers] = useState<SubscriberListItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [adding, setAdding] = useState(false);
+  const [newCallerId, setNewCallerId] = useState('');
+  const [newImsi, setNewImsi] = useState('');
+  const [newLabel, setNewLabel] = useState('');
+
+  // Inline row editor — same shape as DidMappingsCard's own. editingImsi
+  // tracks which row's key is being edited (the row's ORIGINAL subscriber,
+  // even though editImsi below may change it to someone else).
+  const [editingImsi, setEditingImsi] = useState<string | null>(null);
+  const [editCallerId, setEditCallerId] = useState('');
+  const [editImsi, setEditImsi] = useState('');
+  const [editLabel, setEditLabel] = useState('');
+  const [savingEdit, setSavingEdit] = useState(false);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const [cidRes, subRes] = await Promise.all([
+        pstnApi.listOutboundCallerIds(),
+        subscriberApi.list(0, 500),
+      ]);
+      setEntries(cidRes.outboundCallerIds);
+      setSubscribers(subRes.subscribers);
+    } catch { /* ignore */ }
+    finally { setLoading(false); }
+  }, []);
+
+  useEffect(() => { load(); }, [load]);
+
+  const handleAdd = async () => {
+    if (!newCallerId || !newImsi) return;
+    setAdding(true);
+    try {
+      await pstnApi.setOutboundCallerId(newImsi, newCallerId, newLabel || undefined);
+      toast.success(`Outbound caller ID set to ${newCallerId}`);
+      setNewCallerId(''); setNewImsi(''); setNewLabel('');
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setAdding(false);
+    }
+  };
+
+  const handleRemove = async (subscriberImsi: string) => {
+    try {
+      await pstnApi.removeOutboundCallerId(subscriberImsi);
+      toast.success('Outbound caller ID removed');
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    }
+  };
+
+  const startEdit = (e: OutboundCallerId) => {
+    setEditingImsi(e.subscriberImsi); setEditCallerId(e.callerId); setEditImsi(e.subscriberImsi); setEditLabel(e.label ?? '');
+  };
+  const cancelEdit = () => setEditingImsi(null);
+  const saveEdit = async () => {
+    if (!editingImsi || !editCallerId || !editImsi) return;
+    setSavingEdit(true);
+    try {
+      await pstnApi.updateOutboundCallerId(editingImsi, editImsi, editCallerId, editLabel || undefined);
+      toast.success(`Outbound caller ID updated to ${editCallerId}`);
+      setEditingImsi(null);
+      await load();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setSavingEdit(false);
+    }
+  };
+
+  return (
+    <div className="nms-card">
+      <h2 className="text-sm font-semibold text-nms-text flex items-center gap-2 mb-1">
+        <PhoneOutgoing className="w-4 h-4 text-nms-accent" /> Outbound Caller ID
+      </h2>
+      <p className="text-xs text-nms-text-dim mb-4">
+        Set what caller ID a subscriber presents when calling out through the external trunk —
+        independent of any inbound DID(s) mapped above (some providers only route an outbound
+        call whose caller ID matches a number they recognize). A subscriber with nothing set
+        here still dials out fine, presenting their real MSISDN instead. Currently only takes
+        effect for 4G/5G (IMS) subscribers — outbound calling through the external trunk isn't
+        built for 2G yet.
+      </p>
+
+      {!imsConfigured ? (
+        <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2">
+          Configure IMS before setting outbound caller IDs — the dialplan needs the IMS domain.
+        </p>
+      ) : (
+        <>
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mb-4">
+            <div>
+              <label className="nms-label">Caller ID</label>
+              <input value={newCallerId} onChange={e => setNewCallerId(e.target.value)}
+                placeholder="16038022223" className="nms-input font-mono text-xs mt-1" />
+              <p className="text-xs text-nms-text-dim mt-1">Any digits, any length — no "+" needed</p>
+            </div>
+            <div>
+              <label className="nms-label">Subscriber</label>
+              <select value={newImsi} onChange={e => setNewImsi(e.target.value)} className="nms-input text-xs mt-1">
+                <option value="">Select subscriber…</option>
+                {subscribers.map(s => (
+                  <option key={s.imsi} value={s.imsi}>
+                    {s.nickname ? `${s.nickname} (${s.imsi})` : s.imsi}{s.msisdn?.[0] ? ` — ${s.msisdn[0]}` : ''}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="nms-label">Label <span className="text-nms-text-dim font-normal">(optional)</span></label>
+              <input value={newLabel} onChange={e => setNewLabel(e.target.value)}
+                placeholder="e.g. Main Office Line" className="nms-input text-xs mt-1" />
+            </div>
+            <div className="flex items-end">
+              <button onClick={handleAdd} disabled={adding || !newCallerId || !newImsi}
+                className="nms-btn-primary flex items-center gap-2 text-sm w-full justify-center">
+                <Plus className="w-4 h-4" /> {adding ? 'Saving…' : 'Set'}
+              </button>
+            </div>
+          </div>
+
+          {loading ? (
+            <div className="flex items-center justify-center py-6 text-nms-text-dim text-sm">
+              <RefreshCw className="w-4 h-4 animate-spin mr-2" /> Loading…
+            </div>
+          ) : entries.length === 0 ? (
+            <p className="text-xs text-nms-text-dim text-center py-6">No outbound caller IDs assigned yet.</p>
+          ) : (
+            <div className="border border-nms-border rounded-lg overflow-hidden">
+              <table className="w-full text-xs">
+                <thead className="bg-nms-surface-2 text-nms-text-dim">
+                  <tr>
+                    <th className="text-left px-3 py-2 font-medium">Caller ID</th>
+                    <th className="text-left px-3 py-2 font-medium">Subscriber</th>
+                    <th className="text-left px-3 py-2 font-medium">Label</th>
+                    <th className="px-3 py-2"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {entries.map(e => editingImsi === e.subscriberImsi ? (
+                    <tr key={e.subscriberImsi} className="border-t border-nms-border bg-nms-accent/5">
+                      <td className="px-3 py-1.5">
+                        <input autoFocus value={editCallerId} onChange={ev => setEditCallerId(ev.target.value)}
+                          className="nms-input font-mono text-xs py-1 px-1.5 h-7 w-28" />
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <select value={editImsi} onChange={ev => setEditImsi(ev.target.value)} className="nms-input text-xs py-1 h-7">
+                          {subscribers.map(s => (
+                            <option key={s.imsi} value={s.imsi}>
+                              {s.nickname ? `${s.nickname} (${s.imsi})` : s.imsi}{s.msisdn?.[0] ? ` — ${s.msisdn[0]}` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-3 py-1.5">
+                        <input value={editLabel} onChange={ev => setEditLabel(ev.target.value)}
+                          className="nms-input text-xs py-1 px-1.5 h-7 w-full" placeholder="Label" />
+                      </td>
+                      <td className="px-3 py-1.5 text-right whitespace-nowrap">
+                        <button onClick={saveEdit} disabled={savingEdit || !editCallerId || !editImsi} className="text-nms-green hover:text-nms-green/80 disabled:opacity-50 mr-2">
+                          <Check className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={cancelEdit} disabled={savingEdit} className="text-nms-text-dim hover:text-nms-text">
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ) : (
+                    <tr key={e.subscriberImsi} className="border-t border-nms-border group/row">
+                      <td className="px-3 py-2 font-mono text-nms-text">{e.callerId}</td>
+                      <td className="px-3 py-2 text-nms-text-dim">
+                        {e.subscriberNickname ? `${e.subscriberNickname} ` : ''}
+                        <span className="font-mono">{e.subscriberImsi}</span>
+                        {e.subscriberMsisdn ? ` (${e.subscriberMsisdn})` : ''}
+                      </td>
+                      <td className="px-3 py-2 text-nms-text-dim">{e.label ?? '—'}</td>
+                      <td className="px-3 py-2 text-right whitespace-nowrap">
+                        <button onClick={() => startEdit(e)} disabled={!!editingImsi}
+                          className="text-nms-text-dim opacity-0 group-hover/row:opacity-100 hover:text-nms-accent transition-opacity mr-2 disabled:opacity-0">
+                          <Pencil className="w-3.5 h-3.5" />
+                        </button>
+                        <button onClick={() => handleRemove(e.subscriberImsi)} disabled={!!editingImsi} className="text-red-400 hover:text-red-300 disabled:opacity-30">
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
 // The entire user-facing surface of the Cross-RAN Calling feature — one
 // toggle, nothing else. Everything it takes to actually work (the new
 // inter-Asterisk PJSIP trunk on both instances, dialplan forwarding blocks
@@ -308,6 +741,177 @@ function CrossRanToggleCard({ status, onChanged }: { status: PstnStatus | null; 
           {collisions.length > 0 && <div className="mt-1 font-mono">{collisions.join(', ')}</div>}
         </div>
       )}
+    </div>
+  );
+}
+
+// The real external SIP trunk to a third-party Asterisk server with real
+// PSTN/DID connectivity — the actual "leave this host" piece the rest of
+// this module builds toward. Two-step, deliberately: Configure only saves
+// the field values (bindIp/provider host/CIDR etc.), Enable is a separate
+// action that actually writes the live PJSIP config and opens the nftables
+// allowlist — a real network-facing port deserves an explicit second step,
+// unlike the loopback-only Cross-RAN toggle above. Values pre-fill from
+// status.currentConfig?.externalTrunk so re-opening this after a save
+// doesn't require re-typing everything.
+function ExternalTrunkCard({ status, onChanged }: { status: PstnStatus | null; onChanged: () => void }) {
+  const existing = status?.currentConfig?.externalTrunk;
+  const [bindIp, setBindIp] = useState(existing?.bindIp ?? '');
+  const [bindPort, setBindPort] = useState(String(existing?.bindPort ?? 5060));
+  const [interfaceMode, setInterfaceMode] = useState<'dummy' | 'existing'>(existing?.interfaceMode ?? 'dummy');
+  const [externalMediaAddress, setExternalMediaAddress] = useState(existing?.externalMediaAddress ?? '');
+  const [providerHost, setProviderHost] = useState(existing?.providerHost ?? '');
+  const [providerPort, setProviderPort] = useState(String(existing?.providerPort ?? 5060));
+  const [providerCidr, setProviderCidr] = useState(existing?.providerCidr ?? '');
+  const [saving, setSaving] = useState(false);
+  const [toggling, setToggling] = useState(false);
+  const [frrAcknowledged, setFrrAcknowledged] = useState(false);
+  const enabled = !!status?.externalTrunkEnabled;
+
+  // Same shape as SecGW's own needsFrrAck: prompt on first-ever configure,
+  // and again any time the bind IP itself changes (a different address may
+  // need its own EIGRP network statement even if one was added before).
+  const bindIpChanged = !!existing?.bindIp && bindIp !== existing.bindIp;
+  const needsFrrAck = !existing || bindIpChanged;
+
+  // Pre-fill from the Auto-Config page's Static IP Plan when never
+  // configured here yet — same smart-default pattern as SecGWPage/VoWiFiPage.
+  useEffect(() => {
+    if (existing?.bindIp) return;
+    ipPlanApi.get('pstn-external-trunk').then(ip => { if (ip) setBindIp(ip); }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleConfigure = async () => {
+    if (!bindIp || !providerHost) return;
+    setSaving(true);
+    try {
+      await pstnApi.configureExternalTrunk({
+        bindIp, bindPort: Number(bindPort) || 5060, interfaceMode,
+        externalMediaAddress: externalMediaAddress || undefined,
+        providerHost, providerPort: Number(providerPort) || 5060,
+        providerCidr: providerCidr || undefined,
+      });
+      toast.success('External trunk configured');
+      setFrrAcknowledged(false);
+      onChanged();
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const handleToggle = async () => {
+    setToggling(true);
+    try {
+      if (enabled) {
+        await pstnApi.disableExternalTrunk();
+        toast.success('External trunk disabled');
+      } else {
+        await pstnApi.enableExternalTrunk();
+        toast.success('External trunk enabled');
+      }
+    } catch (err: any) {
+      toast.error(err?.response?.data?.error ?? err.message);
+    } finally {
+      setToggling(false);
+      onChanged();
+    }
+  };
+
+  return (
+    <div className="nms-card">
+      <div className="flex items-center justify-between flex-wrap gap-3 mb-1">
+        <h2 className="text-sm font-semibold text-nms-text flex items-center gap-2">
+          <Signal className="w-4 h-4 text-nms-accent" /> External SIP Trunk
+        </h2>
+        <button
+          onClick={handleToggle}
+          disabled={toggling || !status?.hasSavedConfig || !existing}
+          className={clsx(
+            'flex items-center gap-1.5 text-xs px-2.5 py-1.5 rounded-md border transition-all shrink-0 disabled:opacity-50 disabled:cursor-not-allowed',
+            enabled
+              ? 'bg-green-500/15 text-green-400 border-green-500/30 hover:bg-green-500/25'
+              : 'bg-nms-surface-2 text-nms-text-dim border-nms-border hover:text-nms-text',
+          )}
+        >
+          <Power className="w-3 h-3" />
+          {toggling ? '…' : enabled ? 'Enabled' : 'Disabled'}
+        </button>
+      </div>
+      <p className="text-xs text-nms-text-dim mb-4">
+        A real SIP trunk to a third-party Asterisk server with real DID connectivity. Plain UDP,
+        restricted to the provider's IP/CIDR via a dedicated firewall rule — configure the fields
+        below, then enable once you're ready to actually open the port.
+      </p>
+
+      {needsFrrAck && (
+        <div className="nms-card border-amber-500/40 bg-amber-500/5 mb-4">
+          <div className="flex items-start gap-3">
+            <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+            <div className="text-xs text-amber-200 leading-relaxed">
+              <p className="font-semibold text-amber-400 mb-1">Before configuring: make the bind IP reachable from the provider.</p>
+              <p>
+                This module never edits <span className="font-mono">frr.conf</span> automatically. If the
+                provider sits behind EIGRP-carried routing, add the bind IP yourself, e.g.:
+              </p>
+              <pre className="bg-nms-bg border border-nms-border rounded px-2 py-1 mt-1.5 font-mono text-[11px] text-amber-100">network {bindIp || '<bind IP>'}/32</pre>
+              <label className="flex items-center gap-2 mt-2 cursor-pointer">
+                <input type="checkbox" checked={frrAcknowledged} onChange={e => setFrrAcknowledged(e.target.checked)} />
+                I've added the route (or the provider doesn't need one — e.g. same LAN segment)
+              </label>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mb-4">
+        <div>
+          <label className="nms-label">Bind IP</label>
+          <input value={bindIp} onChange={e => setBindIp(e.target.value)}
+            placeholder="10.0.1.50" className="nms-input font-mono text-xs mt-1" />
+          <p className="text-xs text-nms-text-dim mt-1">A real, non-loopback interface the provider can reach</p>
+        </div>
+        <div>
+          <label className="nms-label">Bind port</label>
+          <input value={bindPort} onChange={e => setBindPort(e.target.value)}
+            placeholder="5060" className="nms-input font-mono text-xs mt-1" />
+        </div>
+        <div>
+          <label className="nms-label">Interface mode</label>
+          <select value={interfaceMode} onChange={e => setInterfaceMode(e.target.value as 'dummy' | 'existing')} className="nms-input text-xs mt-1">
+            <option value="dummy">Create dummy interface</option>
+            <option value="existing">Use existing IP</option>
+          </select>
+          <p className="text-xs text-nms-text-dim mt-1">Dummy mode creates and persists the Bind IP above for you</p>
+        </div>
+        <div>
+          <label className="nms-label">External media address <span className="text-nms-text-dim font-normal">(optional)</span></label>
+          <input value={externalMediaAddress} onChange={e => setExternalMediaAddress(e.target.value)}
+            placeholder="defaults to Bind IP" className="nms-input font-mono text-xs mt-1" />
+          <p className="text-xs text-nms-text-dim mt-1">Only needed if this host is behind NAT relative to the provider</p>
+        </div>
+        <div>
+          <label className="nms-label">Provider host</label>
+          <input value={providerHost} onChange={e => setProviderHost(e.target.value)}
+            placeholder="sip.provider.example.com" className="nms-input font-mono text-xs mt-1" />
+        </div>
+        <div>
+          <label className="nms-label">Provider port</label>
+          <input value={providerPort} onChange={e => setProviderPort(e.target.value)}
+            placeholder="5060" className="nms-input font-mono text-xs mt-1" />
+        </div>
+        <div>
+          <label className="nms-label">Provider CIDR <span className="text-nms-text-dim font-normal">(optional)</span></label>
+          <input value={providerCidr} onChange={e => setProviderCidr(e.target.value)}
+            placeholder="defaults to host/32" className="nms-input font-mono text-xs mt-1" />
+          <p className="text-xs text-nms-text-dim mt-1">Widen to a real CIDR block if the provider sends from a range</p>
+        </div>
+      </div>
+      <button onClick={handleConfigure} disabled={saving || !bindIp || !providerHost || (needsFrrAck && !frrAcknowledged)} className="nms-btn-primary flex items-center gap-2 text-sm">
+        <Settings className="w-4 h-4" /> {saving ? 'Saving…' : 'Configure'}
+      </button>
     </div>
   );
 }
@@ -460,7 +1064,7 @@ function Gsm2gExtensionsCard() {
 }
 
 export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => void }) {
-  const [tab, setTab] = useState<'setup' | 'extensions' | 'configs'>('setup');
+  const [tab, setTab] = useState<'setup' | 'extensions' | 'did-mapping' | 'configs'>('setup');
   const [status, setStatus] = useState<PstnStatus | null>(null);
   const [a2gStatus, setA2gStatus] = useState<Asterisk2gStatus | null>(null);
   const [loading, setLoading] = useState(true);
@@ -537,7 +1141,7 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
           setUninstallLog(prev => prev + dec.decode(value, { stream: true }));
         }
       }
-      toast.success('PSTN Gateway removed');
+      toast.success('Voice Gateway removed');
       await load(true);
     } catch (err: any) {
       toast.error(`Uninstall failed: ${err.message}`);
@@ -564,10 +1168,10 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
     try {
       if (status?.pstnEnabled) {
         await pstnApi.disable();
-        toast.success('PSTN Gateway disabled — S-CSCF no longer routes to Asterisk');
+        toast.success('Voice Gateway disabled — S-CSCF no longer routes to Asterisk');
       } else {
         await pstnApi.enable();
-        toast.success('PSTN Gateway enabled');
+        toast.success('Voice Gateway enabled');
       }
       await load(true);
     } catch (err: any) {
@@ -592,7 +1196,7 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
 
   if (loading) return (
     <div className="p-6 flex items-center justify-center h-64 text-nms-text-dim">
-      <RefreshCw className="w-5 h-5 animate-spin mr-2" /> Loading PSTN Gateway status…
+      <RefreshCw className="w-5 h-5 animate-spin mr-2" /> Loading Voice Gateway status…
     </div>
   );
 
@@ -607,7 +1211,7 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
             <h1 className="text-2xl font-semibold font-display">Voice Gateway</h1>
             <span className="text-xs font-semibold uppercase tracking-wider px-2 py-0.5 rounded-full text-amber-400 bg-amber-500/10 border border-amber-500/30">Beta</span>
           </div>
-          <p className="text-sm text-nms-text-dim mt-1">Asterisk-based PSTN interconnect for the IMS core</p>
+          <p className="text-sm text-nms-text-dim mt-1">Asterisk-based voice interconnect — internal cross-RAN calling (2G/4G/5G) plus a real external SIP trunk with DID mapping</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap shrink-0">
           {installed && svcs && (
@@ -663,10 +1267,13 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
         <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
         <p className="text-xs text-amber-200 leading-relaxed">
           <span className="font-semibold text-amber-400">Beta feature.</span>{' '}
-          This wires Asterisk into an internal extension-to-subscriber test path only — there is{' '}
-          <span className="font-semibold">no public SIP trunk connectivity yet</span>. Real-world
-          calls to/from the public phone network (via a provider like Twilio or Telnyx) are not
-          supported in this release.
+          Internal short-code/MSISDN dialing and Cross-RAN Calling are stable. The{' '}
+          <span className="font-semibold">External SIP Trunk</span> mechanism below is built and
+          tested end-to-end (transport, firewall allowlist, DID routing, outbound classification) —
+          including a real inbound call into a 2G-routed DID, which now gets an immediate ringback
+          so the caller's own server doesn't give up while the radio pages — but hasn't yet been
+          pointed at a live real-world SIP provider on this deployment. Configure and enable it
+          once you have real provider details on hand.
         </p>
       </div>
 
@@ -675,14 +1282,15 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
           <div className="bg-nms-surface border border-nms-border rounded-xl p-6 max-w-md w-full mx-4 shadow-2xl">
             <div className="flex items-center gap-3 mb-4">
               <Trash2 className="w-5 h-5 text-red-400 shrink-0" />
-              <h2 className="text-base font-semibold text-nms-text">Uninstall PSTN Gateway</h2>
+              <h2 className="text-base font-semibold text-nms-text">Uninstall Voice Gateway</h2>
             </div>
-            <p className="text-sm text-nms-text-dim mb-3 leading-relaxed">This completely removes the PSTN Gateway:</p>
+            <p className="text-sm text-nms-text-dim mb-3 leading-relaxed">This completely removes the Voice Gateway:</p>
             <ul className="text-xs text-nms-text-dim space-y-1 mb-4 pl-4 list-disc">
-              <li>Remove S-CSCF's dispatcher entry and restart kamailio-scscf</li>
+              <li>Remove S-CSCF's dispatcher entry (live reload, no restart)</li>
               <li>Stop and disable Asterisk</li>
-              <li>Delete all extension→subscriber mappings</li>
-              <li>Purge the asterisk/asterisk-modules packages</li>
+              <li>Delete all extension→subscriber mappings and DID mappings</li>
+              <li>Remove the external SIP trunk's firewall allowlist, if it was enabled</li>
+              <li>Purge the asterisk/asterisk-modules packages (skipped if Asterisk-2G still needs them)</li>
             </ul>
             <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2 mb-5">
               This does not touch IMS, subscribers, or any other module. Cannot be undone.
@@ -715,9 +1323,10 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
       <div className="flex justify-center">
         <div className="flex gap-1 p-1 bg-nms-surface-2 rounded-lg border border-nms-border">
           {([
-            { id: 'setup',      label: 'Setup',        icon: <Settings className="w-4 h-4" /> },
-            { id: 'extensions', label: 'Extensions',    icon: <PhoneCall className="w-4 h-4" /> },
-            { id: 'configs',    label: 'Config Files',  icon: <FileText className="w-4 h-4" /> },
+            { id: 'setup',       label: 'Setup',        icon: <Settings className="w-4 h-4" /> },
+            { id: 'extensions',  label: 'Extensions',    icon: <PhoneCall className="w-4 h-4" /> },
+            { id: 'did-mapping', label: 'DID Mapping',   icon: <PhoneOutgoing className="w-4 h-4" /> },
+            { id: 'configs',     label: 'Config Files',  icon: <FileText className="w-4 h-4" /> },
           ] as const).map(tabDef => (
             <button
               key={tabDef.id}
@@ -758,7 +1367,7 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
                   <p className="text-xs text-nms-text-dim mt-1">
                     Installs <span className="font-mono">asterisk asterisk-modules</span> on the host via apt,
                     disables the deprecated chan_sip module, and verifies AMR-WB codec support. Requires IMS to
-                    already be installed — PSTN Gateway is built entirely on top of IMS's Kamailio signaling chain.
+                    already be installed — the Voice Gateway is built entirely on top of IMS's Kamailio signaling chain.
                   </p>
                 </div>
                 <button onClick={handleInstall} disabled={acting || !status?.imsInstalled} className="nms-btn-primary flex items-center gap-2 text-sm shrink-0">
@@ -780,7 +1389,9 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
                 <Settings className="w-4 h-4 text-nms-accent" /> Configure
               </h2>
               <p className="text-xs text-nms-text-dim mb-4">
-                Wires Asterisk into S-CSCF's dispatcher for PSTN-bound calls. Requires IMS to already be configured.
+                Wires Asterisk into S-CSCF's dispatcher and sets up its internal SIP trunk — the base
+                step every other capability on this page builds on (short codes, DID mapping,
+                Cross-RAN Calling, and the external SIP trunk below). Requires IMS to already be configured.
               </p>
               {!status?.imsConfigured && (
                 <p className="text-xs text-amber-400 bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2 mb-4">
@@ -805,6 +1416,10 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
                 <Settings className="w-4 h-4" /> {acting ? 'Configuring…' : 'Configure'}
               </button>
             </div>
+          )}
+
+          {installed && status?.hasSavedConfig && (
+            <ExternalTrunkCard status={status} onChanged={() => load(true)} />
           )}
 
           {FEATURES.asterisk2g && (
@@ -858,7 +1473,9 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
       {tab === 'extensions' && (
         <div className="space-y-4">
           {installed ? (
-            <ExtensionsCard imsConfigured={!!status?.imsConfigured} />
+            <>
+              <ExtensionsCard imsConfigured={!!status?.imsConfigured} />
+            </>
           ) : (
             <div className="nms-card border-dashed border-nms-border text-center py-10">
               <PhoneCall className="w-10 h-10 text-nms-text-dim/40 mx-auto mb-3" />
@@ -885,6 +1502,25 @@ export function PstnGatewayPage({ onNavigate }: { onNavigate?: (tab: string) => 
                 </p>
               </div>
             )
+          )}
+        </div>
+      )}
+
+      {tab === 'did-mapping' && (
+        <div className="space-y-4">
+          {installed ? (
+            <>
+              <DidMappingsCard imsConfigured={!!status?.imsConfigured} />
+              <OutboundCallerIdCard imsConfigured={!!status?.imsConfigured} />
+            </>
+          ) : (
+            <div className="nms-card border-dashed border-nms-border text-center py-10">
+              <PhoneOutgoing className="w-10 h-10 text-nms-text-dim/40 mx-auto mb-3" />
+              <p className="text-sm text-nms-text-dim">Asterisk is not installed yet.</p>
+              <p className="text-xs text-nms-text-dim mt-1">
+                Install it from the <strong>Setup</strong> tab before mapping DIDs or outbound caller IDs.
+              </p>
+            </div>
           )}
         </div>
       )}
@@ -989,7 +1625,7 @@ function VoiceConfigFilesTab() {
             {selected.source === 'asterisk2g' && (
               <div className="flex items-start gap-2 bg-nms-accent/5 border border-nms-accent/20 rounded-lg p-2.5 text-xs text-nms-text-dim mb-2">
                 <Signal className="w-4 h-4 shrink-0 mt-0.5 text-nms-accent" />
-                <span>Belongs to the Asterisk-2G instance (2G GSM module) — restarting only affects 2G-to-2G voice, not this page's own PSTN Gateway.</span>
+                <span>Belongs to the Asterisk-2G instance (2G GSM module) — restarting only affects 2G-to-2G voice, not this page's own Voice Gateway.</span>
               </div>
             )}
             <div className="border border-nms-border rounded-lg overflow-hidden">

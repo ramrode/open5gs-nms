@@ -426,17 +426,18 @@ export interface BtsEntry {
   // SI2quater params (thresh-hi/lo, prio, qrxlv, meas) are fixed at sane
   // LTE-preferred defaults rather than exposed per carrier.
   lteEarfcns?: number[];
-  // Administrative lock (osmo-bsc's own OML "Admin 'Locked'" state — see
+  // Administrative lock (osmo-bsc's own `rf_locked` TRX state — see
   // reapplyBtsLocks() below for why this needs to be tracked here at all
-  // rather than just fired at the VTY once and forgotten: confirmed live
-  // 2026-09-13 by inspecting the real `bts <N>` config node's full `list`
-  // output that there is NO persisted equivalent directive in osmo-bsc.cfg —
-  // change-adm-state is a runtime-VTY-only toggle that silently reverts to
-  // Unlocked on every osmo-bsc restart.
+  // rather than just fired at the VTY once and forgotten: this project's own
+  // generated osmo-bsc.cfg never emits an `rf_locked` line, so it's a
+  // runtime-VTY-only toggle that silently reverts to Unlocked on every
+  // osmo-bsc restart. See blockBtsByIdx()'s own comment for why this isn't
+  // the older `change-adm-state` command an earlier version of this feature
+  // used — that one never actually worked.
   blocked?: boolean;
 }
 
-interface GsmState {
+export interface GsmState {
   btsEntries: BtsEntry[];
   bscMgwBindIp: string;
   mscMgwBindIp: string;
@@ -520,7 +521,7 @@ function sanitizeGgsnGtpIp(ip: string | undefined): string {
   return !v || GGSN_GTP_IP_BLOCKLIST.includes(v) ? GGSN_GTP_IP_SAFE : v;
 }
 
-function loadGsmState(): GsmState {
+export function loadGsmState(): GsmState {
   try {
     if (fs.existsSync(HOST_GSM_STATE)) {
       const parsed = JSON.parse(fs.readFileSync(HOST_GSM_STATE, 'utf-8'));
@@ -1134,25 +1135,18 @@ async function deriveSgsnGbIp(btsEntries: BtsEntry[]): Promise<string> {
 }
 
 // Re-locks every BTS marked blocked in state, over VTY. Needed because
-// change-adm-state has no persisted config-file equivalent (see BtsEntry.
-// blocked's comment) — every osmo-bsc restart silently drops back to
-// Unlocked unless this replays the lock. osmo-bsc's VTY isn't necessarily
+// rf_locked has no effect on this project's own generated osmo-bsc.cfg (see
+// BtsEntry.blocked's comment) — every osmo-bsc restart silently drops back
+// to Unlocked unless this replays the lock. osmo-bsc's VTY isn't necessarily
 // up the instant `systemctl restart` returns, so this retries briefly
 // rather than racing it.
 //
-// The OML object-instance triple for NM object class "bts" is
-// (bts_nr, 0xff, 0xff) — trx/ts wildcarded, since the top-level BTS object
-// has no specific trx/timeslot of its own — NOT (bts_nr, 0, 0). Real,
-// confirmed live incident (2026-09-13): using (idx, 0, 0) got a real
-// nanoBTS's own NACK ("CHANGE ADMINISTRATIVE STATE NACK CAUSE=Object
-// Instance unknown"), and osmo-bsc's own reaction to ANY change-adm-state
-// NACK is to immediately drop the whole OML link
-// (osmo_bsc_main.c:"Got CHANGE ADMINISTRATIVE STATE NACK going to drop the
-// OML links") — cascading every child NM object into Locked/Not-installed
-// and taking the radio off the air until a full osmo-bsc restart forced a
-// clean OML re-handshake. Confirmed correct instance from the SAME
-// journalctl output's own successful state-change lines afterward:
-// "OC=BTS(01) INST=(00,ff,ff): STATE CHG: ...".
+// `rf_locked 1` at `configure terminal -> network -> bts N -> trx N`, NOT
+// `change-adm-state locked` at the old "(oml)" pseudo-node this used to
+// send — that command is silently overridden by osmo-bsc's own reconciliation
+// loop and never actually sticks. See blockBtsByIdx()'s own comment (the
+// interactive block/unblock route below) for the full story, confirmed live
+// 2026-09-21 by reading osmo-bsc 1.9.0's real source.
 async function reapplyBtsLocks(state: GsmState): Promise<void> {
   const lockedIdx = state.btsEntries.map((e, i) => (e.blocked ? i : -1)).filter(i => i >= 0);
   if (lockedIdx.length === 0) return;
@@ -1160,7 +1154,7 @@ async function reapplyBtsLocks(state: GsmState): Promise<void> {
     await new Promise(r => setTimeout(r, 1500));
     try {
       for (const idx of lockedIdx) {
-        await bscVtyCommand([`bts ${idx} oml class bts instance ${idx} 255 255`, 'change-adm-state locked']);
+        await bscVtyCommand(['configure terminal', 'network', `bts ${idx}`, 'trx 0', 'rf_locked 1', 'end']);
       }
       return;
     } catch {
@@ -1246,6 +1240,114 @@ async function regenerateGsmConfigs(state: GsmState): Promise<void> {
     // depend on), so this isn't a new requirement, just an explicit one.
     await configureSms(currentSms);
   }
+}
+
+// Extracted from what used to be POST /configure's own inline handler body
+// (the route below is now a thin wrapper) so the IP Plan apply orchestrator
+// can call this in-process for a single-field IP change, matching every
+// other module's exported configureX() shape. Every field here is already
+// optional/partial by the original handler's own design — each one falls
+// back to the current saved value when omitted, so passing e.g. just
+// `{ bscMgwBindIp: newIp }` alone is safe and changes nothing else.
+export interface ConfigureGsmInput {
+  bscMgwBindIp?: string; mscMgwBindIp?: string; mgwRtpBindIp?: string;
+  gprsEnabled?: boolean; gprsMode?: 'gprs' | 'egprs'; sgsnGtpLocalIp?: string;
+  ggsnGtpBindIp?: string; ggsnApn?: string; ggsnTunDevice?: string; ggsnPoolCidr?: string;
+  ggsnDns1?: string; ggsnDns2?: string; gprsNat?: boolean; sgsnGbRemoteIp?: string;
+}
+
+export async function configureGsm(input: ConfigureGsmInput): Promise<{ eigrpApplied: string | null }> {
+  const state = loadGsmState();
+  state.bscMgwBindIp = input.bscMgwBindIp || state.bscMgwBindIp;
+  state.mscMgwBindIp = input.mscMgwBindIp || state.mscMgwBindIp;
+  state.mgwRtpBindIp = input.mgwRtpBindIp || state.mgwRtpBindIp;
+  if (typeof input.gprsEnabled === 'boolean') state.gprsEnabled = input.gprsEnabled;
+  if (input.gprsMode === 'gprs' || input.gprsMode === 'egprs') state.gprsMode = input.gprsMode;
+  // The Setup-tab GPRS/EDGE toggle is the single control for data-service
+  // type — apply it to every BTS here (enabled → chosen mode on all,
+  // disabled → 'none' on all) so it isn't also buried per-BTS.
+  const perBtsMode: BtsEntry['gprsMode'] = state.gprsEnabled ? (state.gprsMode ?? 'gprs') : 'none';
+  for (const b of state.btsEntries) b.gprsMode = perBtsMode;
+  state.sgsnGtpLocalIp = input.sgsnGtpLocalIp || state.sgsnGtpLocalIp;
+  state.ggsnGtpBindIp  = sanitizeGgsnGtpIp(input.ggsnGtpBindIp || state.ggsnGtpBindIp);
+  state.ggsnApn        = input.ggsnApn        || state.ggsnApn;
+  state.ggsnTunDevice  = input.ggsnTunDevice  || state.ggsnTunDevice;
+  state.ggsnPoolCidr   = input.ggsnPoolCidr   ?? state.ggsnPoolCidr;
+  state.ggsnDns1       = input.ggsnDns1       || state.ggsnDns1;
+  state.ggsnDns2       = input.ggsnDns2       || state.ggsnDns2;
+  if (typeof input.gprsNat === 'boolean') state.gprsNat = input.gprsNat;
+  // SGSN Gb address: honour an explicit value, else auto-derive this host's
+  // IP on the same subnet as the first remote radio (so a nanoBTS's PCU
+  // actually reaches the SGSN instead of dialling 127.0.0.1 into itself).
+  state.sgsnGbRemoteIp = input.sgsnGbRemoteIp ?? state.sgsnGbRemoteIp ?? '';
+  if (!state.sgsnGbRemoteIp && state.gprsEnabled) {
+    state.sgsnGbRemoteIp = await deriveSgsnGbIp(state.btsEntries);
+  }
+  saveGsmState(state);
+  await regenerateGsmConfigs(state);
+  await nsenter('systemctl', ['restart', 'osmo-mgw']);
+  await restartOsmoBsc(state);
+  let eigrpApplied: string | null = null;
+  const wantCidr = state.gprsEnabled && state.ggsnPoolCidr ? state.ggsnPoolCidr : null;
+  if (wantCidr) {
+    await nsenter('systemctl', ['restart', 'osmo-sgsn']).catch(() => {});
+    await nsenter('systemctl', ['restart', 'osmo-ggsn']).catch(() => {});
+    // osmo-pcu only applies to a locally-run osmo-bts (virtual/trx) — a real
+    // ip.access nanoBTS runs its own internal PCU and connects Gb straight
+    // to the SGSN, so osmo-pcu would just crash-loop trying to reach a
+    // /tmp/pcu_bts socket that never appears.
+    const hasLocalBts = state.btsEntries.some(e => e.backend === 'virtual' || e.backend === 'trx');
+    if (hasLocalBts) {
+      await nsenter('systemctl', ['restart', 'osmo-pcu']).catch(() => {});
+    } else {
+      await nsenter('systemctl', ['disable', '--now', 'osmo-pcu']).catch(() => {});
+    }
+  }
+  // Make the GGSN pool reachable — no manual step. Two modes:
+  //  - routed (default): auto-add an EIGRP `network` statement via the
+  //    *incremental* live vtysh path (never `systemctl restart frr` — that's
+  //    this project's confirmed eigrpd crash trigger, CLAUDE.md gotcha #7);
+  //    the pool must be a disjoint sub-block of a routed subnet.
+  //  - NAT: MASQUERADE the pool out instead; then it only has to not overlap
+  //    Open5GS's own UE subnet.
+  // Whichever mode is active, the other mode's leftover rule is torn down so
+  // a toggle doesn't strand a stale route/masq.
+  const dev = state.ggsnTunDevice || 'apn-gprs';
+  const wantEigrp = wantCidr && !state.gprsNat ? wantCidr : null;
+  const wantNat   = wantCidr &&  state.gprsNat ? wantCidr : null;
+  if (state.appliedGprsEigrpCidr && state.appliedGprsEigrpCidr !== wantEigrp) {
+    eigrpApplied = await applyGprsEigrpRoute(null, state.appliedGprsEigrpCidr, dev);
+    state.appliedGprsEigrpCidr = undefined; saveGsmState(state);
+  }
+  if (state.appliedGprsNatCidr && state.appliedGprsNatCidr !== wantNat) {
+    eigrpApplied = await applyGprsNat(null, state.appliedGprsNatCidr, dev);
+    state.appliedGprsNatCidr = undefined; saveGsmState(state);
+  }
+  if (wantEigrp && wantEigrp !== state.appliedGprsEigrpCidr) {
+    eigrpApplied = await applyGprsEigrpRoute(wantEigrp, null, dev);
+    state.appliedGprsEigrpCidr = wantEigrp; saveGsmState(state);
+  }
+  if (wantNat && wantNat !== state.appliedGprsNatCidr) {
+    eigrpApplied = await applyGprsNat(wantNat, null, dev);
+    state.appliedGprsNatCidr = wantNat; saveGsmState(state);
+  }
+  // FORWARD ACCEPT for the GGSN tun — mode-independent (see helper).
+  await ensureGprsForwardAccept(dev, !!state.gprsEnabled);
+  return { eigrpApplied };
+}
+
+// Matches every other module's getXStaleness() naming/shape (secgw, vowifi,
+// ims, mms, pstn all have one) — GSM never had one until now. No state
+// boolean exists for "configured" here (unlike those modules), so this
+// mirrors the exact file-existence heuristic GET /status has always used.
+export async function getGsmStaleness(): Promise<{ installedOnDisk: boolean; configured: boolean }> {
+  const [bscWhich, mgwWhich] = await Promise.all([
+    nsenter('which', ['osmo-bsc']).catch(() => ({ stdout: '', stderr: '' })),
+    nsenter('which', ['osmo-mgw']).catch(() => ({ stdout: '', stderr: '' })),
+  ]);
+  const installedOnDisk = bscWhich.stdout.trim().length > 0 && mgwWhich.stdout.trim().length > 0;
+  const configured = fs.existsSync(`${HOST_OSMOCOM_DIR}/osmo-bsc.cfg`) && fs.existsSync(`${HOST_OSMOCOM_DIR}/osmo-mgw.cfg`);
+  return { installedOnDisk, configured };
 }
 
 // ─── Router ─────────────────────────────────────────────────────────────────
@@ -1385,88 +1487,14 @@ export function createGsmRouter(subscriberRepo: ISubscriberRepository, logger: p
     res.end();
   });
 
-  // POST /api/gsm/configure — Body: { bscMgwBindIp?, mscMgwBindIp?, mgwRtpBindIp? }
+  // POST /api/gsm/configure — Body: { bscMgwBindIp?, mscMgwBindIp?, mgwRtpBindIp?, ... }
+  // Thin wrapper — see configureGsm() above for the actual logic, extracted
+  // so the IP Plan apply orchestrator can call it in-process too.
   router.post('/configure', requireAdmin, async (req: Request, res: Response) => {
     const user = (req as any).user?.username ?? 'unknown';
     try {
+      const { eigrpApplied } = await configureGsm(req.body as ConfigureGsmInput);
       const state = loadGsmState();
-      state.bscMgwBindIp = (req.body.bscMgwBindIp as string) || state.bscMgwBindIp;
-      state.mscMgwBindIp = (req.body.mscMgwBindIp as string) || state.mscMgwBindIp;
-      state.mgwRtpBindIp = (req.body.mgwRtpBindIp as string) || state.mgwRtpBindIp;
-      if (typeof req.body.gprsEnabled === 'boolean') state.gprsEnabled = req.body.gprsEnabled;
-      if (req.body.gprsMode === 'gprs' || req.body.gprsMode === 'egprs') state.gprsMode = req.body.gprsMode;
-      // The Setup-tab GPRS/EDGE toggle is the single control for data-service
-      // type — apply it to every BTS here (enabled → chosen mode on all,
-      // disabled → 'none' on all) so it isn't also buried per-BTS.
-      const perBtsMode: BtsEntry['gprsMode'] = state.gprsEnabled ? (state.gprsMode ?? 'gprs') : 'none';
-      for (const b of state.btsEntries) b.gprsMode = perBtsMode;
-      state.sgsnGtpLocalIp = (req.body.sgsnGtpLocalIp as string) || state.sgsnGtpLocalIp;
-      state.ggsnGtpBindIp  = sanitizeGgsnGtpIp((req.body.ggsnGtpBindIp as string)  || state.ggsnGtpBindIp);
-      state.ggsnApn        = (req.body.ggsnApn as string)        || state.ggsnApn;
-      state.ggsnTunDevice  = (req.body.ggsnTunDevice as string)  || state.ggsnTunDevice;
-      state.ggsnPoolCidr   = (req.body.ggsnPoolCidr as string)   ?? state.ggsnPoolCidr;
-      state.ggsnDns1       = (req.body.ggsnDns1 as string)       || state.ggsnDns1;
-      state.ggsnDns2       = (req.body.ggsnDns2 as string)       || state.ggsnDns2;
-      if (typeof req.body.gprsNat === 'boolean') state.gprsNat = req.body.gprsNat;
-      // SGSN Gb address: honour an explicit value, else auto-derive this
-      // host's IP on the same subnet as the first remote radio (so a
-      // nanoBTS's PCU actually reaches the SGSN instead of dialling
-      // 127.0.0.1 into itself).
-      state.sgsnGbRemoteIp = (req.body.sgsnGbRemoteIp as string) ?? state.sgsnGbRemoteIp ?? '';
-      if (!state.sgsnGbRemoteIp && state.gprsEnabled) {
-        state.sgsnGbRemoteIp = await deriveSgsnGbIp(state.btsEntries);
-      }
-      saveGsmState(state);
-      await regenerateGsmConfigs(state);
-      await nsenter('systemctl', ['restart', 'osmo-mgw']);
-      await restartOsmoBsc(state);
-      let eigrpApplied: string | null = null;
-      const wantCidr = state.gprsEnabled && state.ggsnPoolCidr ? state.ggsnPoolCidr : null;
-      if (wantCidr) {
-        await nsenter('systemctl', ['restart', 'osmo-sgsn']).catch(() => {});
-        await nsenter('systemctl', ['restart', 'osmo-ggsn']).catch(() => {});
-        // osmo-pcu only applies to a locally-run osmo-bts (virtual/trx) — a
-        // real ip.access nanoBTS runs its own internal PCU and connects Gb
-        // straight to the SGSN, so osmo-pcu would just crash-loop trying to
-        // reach a /tmp/pcu_bts socket that never appears.
-        const hasLocalBts = state.btsEntries.some(e => e.backend === 'virtual' || e.backend === 'trx');
-        if (hasLocalBts) {
-          await nsenter('systemctl', ['restart', 'osmo-pcu']).catch(() => {});
-        } else {
-          await nsenter('systemctl', ['disable', '--now', 'osmo-pcu']).catch(() => {});
-        }
-      }
-      // Make the GGSN pool reachable — no manual step. Two modes:
-      //  - routed (default): auto-add an EIGRP `network` statement via the
-      //    *incremental* live vtysh path (never `systemctl restart frr` —
-      //    that's this project's confirmed eigrpd crash trigger, CLAUDE.md
-      //    gotcha #7); the pool must be a disjoint sub-block of a routed
-      //    subnet.
-      //  - NAT: MASQUERADE the pool out instead; then it only has to not
-      //    overlap Open5GS's own UE subnet.
-      // Whichever mode is active, the other mode's leftover rule is torn
-      // down so a toggle doesn't strand a stale route/masq.
-      const dev = state.ggsnTunDevice || 'apn-gprs';
-      const wantEigrp = wantCidr && !state.gprsNat ? wantCidr : null;
-      const wantNat   = wantCidr &&  state.gprsNat ? wantCidr : null;
-      if (state.appliedGprsEigrpCidr && state.appliedGprsEigrpCidr !== wantEigrp) {
-        eigrpApplied = await applyGprsEigrpRoute(null, state.appliedGprsEigrpCidr, dev);
-        state.appliedGprsEigrpCidr = undefined; saveGsmState(state);
-      }
-      if (state.appliedGprsNatCidr && state.appliedGprsNatCidr !== wantNat) {
-        eigrpApplied = await applyGprsNat(null, state.appliedGprsNatCidr, dev);
-        state.appliedGprsNatCidr = undefined; saveGsmState(state);
-      }
-      if (wantEigrp && wantEigrp !== state.appliedGprsEigrpCidr) {
-        eigrpApplied = await applyGprsEigrpRoute(wantEigrp, null, dev);
-        state.appliedGprsEigrpCidr = wantEigrp; saveGsmState(state);
-      }
-      if (wantNat && wantNat !== state.appliedGprsNatCidr) {
-        eigrpApplied = await applyGprsNat(wantNat, null, dev);
-        state.appliedGprsNatCidr = wantNat; saveGsmState(state);
-      }
-      // FORWARD ACCEPT for the GGSN tun — mode-independent (see helper).
-      await ensureGprsForwardAccept(dev, !!state.gprsEnabled);
       await auditLogger.log({ action: 'gsm_configure', user, details: `osmo-bsc/osmo-mgw configured, gprsEnabled=${!!state.gprsEnabled} nat=${!!state.gprsNat}`, success: true });
       res.json({ success: true, eigrpApplied });
     } catch (err) {
@@ -1968,62 +1996,153 @@ export function createGsmRouter(subscriberRepo: ISubscriberRepository, logger: p
 
   // POST /api/gsm/bts/:id/block | /unblock — administratively lock/unlock a
   // BTS via osmo-bsc's own OML Administrative State. Live-verified
-  // 2026-09-12/13 against the real running osmo-bsc: entering
-  // `bts <idx> oml class bts instance <idx> 255 255` drops into the "(oml)"
-  // VTY node, where `change-adm-state locked/unlocked` is the real command —
-  // it's the same Admin 'Locked'/'Unlocked' field parseBtsLinkStatus already
-  // reads back from `show bts N`. This is an osmo-bsc-side state, not a
-  // radio-backend one, so unlike /restart above it applies uniformly to
-  // virtual/trx/real units. The flag is persisted in state (see BtsEntry.
-  // blocked's comment) and reapplied by reapplyBtsLocks() after every
-  // osmo-bsc restart, since osmo-bsc itself forgets it on restart.
+  // 2026-09-12/13 against the real running osmo-bsc, but never actually
+  // verified via this feature's own UI until 2026-09-21 — turned out to
+  // still be broken in a different way (see below). This is an osmo-bsc-side
+  // state, not a radio-backend one, so unlike /restart above it applies
+  // uniformly to virtual/trx/real units. The flag is persisted in state (see
+  // BtsEntry.blocked's comment) and reapplied by reapplyBtsLocks() after
+  // every osmo-bsc restart, since osmo-bsc itself forgets it on restart.
   //
-  // Real incident (2026-09-13): the object instance triple originally used
-  // here was (idx, 0, 0) instead of the correct (idx, 255, 255) — trx/ts
-  // must be wildcarded to 0xff for the "bts" NM object class, which has no
-  // specific trx/timeslot of its own. A real nanoBTS NACK'd (idx,0,0) with
-  // "Object Instance unknown", and osmo-bsc's own reaction to ANY
-  // change-adm-state NACK is to immediately drop the whole OML link — which
-  // took the radio off the air until a full osmo-bsc restart forced a clean
-  // re-handshake. The NACK itself never surfaces as VTY command-line error
-  // text (only in osmo-bsc's own journalctl), so the fix is two-part: the
-  // corrected instance address below, AND verifying the real reported
-  // adminState afterward rather than trusting the VTY prompt returning
-  // cleanly — see CLAUDE.md's "Verify, don't trust 'success'" convention.
-  const setBtsBlocked = (blocked: boolean) => async (req: Request, res: Response) => {
-    const user = (req as any).user?.username ?? 'unknown';
-    const action = blocked ? 'gsm_bts_block' : 'gsm_bts_unblock';
+  // NOT `change-adm-state locked` at the "(oml)" pseudo-node (entered via
+  // `bts <idx> oml class bts instance <idx> 255 255`) — that's what this
+  // used to do, targeting NM object class "bts" directly. Real, confirmed
+  // live incident (2026-09-13): the object instance triple originally used
+  // was (idx, 0, 0) instead of the correct (idx, 255, 255) — a real nanoBTS
+  // NACK'd (idx,0,0) with "Object Instance unknown", and osmo-bsc's own
+  // reaction to ANY change-adm-state NACK is to immediately drop the whole
+  // OML link. That got fixed to (idx,255,255) and the crash stopped — but a
+  // real live test through this bulk-block feature on 2026-09-21 found the
+  // command *still* doesn't work: it's accepted with zero VTY error and
+  // zero journalctl error, but osmo-bsc's own nm_bts_fsm.c runs a background
+  // reconciliation loop (configure_loop()) that silently re-unlocks any
+  // "bts"-class object it considers should be in service, with no guard
+  // against a manual lock — confirmed by locking, then re-reading `show bts
+  // N` immediately and repeatedly over 8+ seconds: Admin state never left
+  // 'Unlocked', and OML Link's own uptime counter never reset (so it's not
+  // an OML reconnect race either — the request is just overridden in
+  // place). The NACK/override itself never surfaces as VTY command-line
+  // error text or a journalctl line (only the *symptom* — the state
+  // silently not changing — is observable), which is exactly why this
+  // needs the read-back-and-compare verify step below rather than trusting
+  // a clean VTY prompt — see CLAUDE.md's "Verify, don't trust 'success'".
+  //
+  // The real, sticky mechanism (confirmed by reading osmo-bsc 1.9.0's own
+  // source — src/osmo-bsc/bts_trx_vty.c's cfg_trx_rf_locked_cmd +
+  // src/osmo-bsc/bts_trx.c's gsm_trx_lock_rf()): `rf_locked (0|1)` is a
+  // config-tree command on the TRX object specifically (configure terminal
+  // -> network -> bts N -> trx N), which sets trx->mo.force_rf_lock — the
+  // one guard nm_rcarrier_fsm.c's own configure_loop() checks before
+  // auto-re-unlocking. CMD_ATTR_IMMEDIATE in the source confirms it takes
+  // effect live, no `write memory`/restart needed — and this deliberately
+  // never calls `write memory` either, since force_rf_lock isn't emitted by
+  // this project's own osmo-bsc.cfg template regen, so persisting it
+  // wouldn't survive a Configure anyway; this NMS's own state +
+  // reapplyBtsLocks() (below) is already the source of truth for "should
+  // this BTS be locked", same as it always was for the old command.
+  //
+  // Verify target changes too: `show bts N` never had a per-TRX NM State
+  // line at all (only BTS-level "NM State:" and "Site Mgr NM State:", both
+  // unrelated to force_rf_lock) — `show trx N 0` is what actually prints
+  // the TRX's own "Radio Carrier NM State: Oper 'x', Admin 'y', Avail 'z'",
+  // which parseBtsLinkStatus's existing regex still matches unmodified
+  // (unanchored, and "Radio Carrier NM State:" prints before "Baseband
+  // Transceiver NM State:" in trx_dump_vty(), so the first match is still
+  // the right one). Only tests trx 0 — every BTS this project manages is
+  // single-TRX; a multi-TRX BTS would need every trx index locked.
+  type BtsBlockResult =
+    | { success: true; name: string; status: BtsLinkStatus }
+    | { success: false; error: string; status?: BtsLinkStatus; name?: string };
+
+  // Core of the single-BTS block/unblock route below, pulled out so the new
+  // bulk /bts/block-all route can drive the same real, verify-after-command
+  // osmo-bsc call per entry rather than re-deriving it. Always re-reads state
+  // fresh (matching this codebase's established "never trust a caller's
+  // stale snapshot" convention) rather than taking `state`/`entry` as params.
+  const blockBtsByIdx = async (idx: number, blocked: boolean, user: string): Promise<BtsBlockResult> => {
     const state = loadGsmState();
-    const idx = state.btsEntries.findIndex(e => e.id === req.params.id);
-    if (idx === -1) { res.status(404).json({ success: false, error: 'BTS entry not found' }); return; }
+    const entry = state.btsEntries[idx];
+    if (!entry) return { success: false, error: 'BTS entry not found' };
+    const action = blocked ? 'gsm_bts_block' : 'gsm_bts_unblock';
     try {
       await bscVtyCommand([
-        `bts ${idx} oml class bts instance ${idx} 255 255`,
-        `change-adm-state ${blocked ? 'locked' : 'unlocked'}`,
+        'configure terminal',
+        'network',
+        `bts ${idx}`,
+        'trx 0',
+        `rf_locked ${blocked ? '1' : '0'}`,
+        'end',
       ]);
-      const raw = await bscVtyCommand(`show bts ${idx}`);
-      const status = parseBtsLinkStatus(raw);
+      // adminState/operState/availState come from the TRX-level read (what
+      // rf_locked actually controls); omlConnected/rslConnected come from
+      // the BTS-level read — `show trx N 0`'s own text has neither field.
+      const trxStatus = parseBtsLinkStatus(await bscVtyCommand(`show trx ${idx} 0`));
+      const btsStatus = parseBtsLinkStatus(await bscVtyCommand(`show bts ${idx}`));
+      const status: BtsLinkStatus = {
+        ...btsStatus,
+        adminState: trxStatus.adminState, operState: trxStatus.operState, availState: trxStatus.availState,
+      };
       const expected = blocked ? 'Locked' : 'Unlocked';
       if (status.adminState !== expected) {
         await auditLogger.log({ action, user, details: `verify failed: adminState=${status.adminState}, expected ${expected}`, success: false });
-        res.status(502).json({
+        return {
           success: false,
           error: `osmo-bsc reports '${status.adminState}', not ${expected}, after the command — not applied as intended. Don't retry blindly: check the BTS's link status and osmo-bsc's own journalctl first, since a stuck state here can mean the OML link needs a clean osmo-bsc restart to recover.`,
-          ...status,
-        });
-        return;
+          status, name: entry.name,
+        };
       }
       state.btsEntries[idx].blocked = blocked;
       saveGsmState(state);
-      await auditLogger.log({ action, user, details: state.btsEntries[idx].name, success: true });
-      res.json({ success: true, ...status });
+      await auditLogger.log({ action, user, details: entry.name, success: true });
+      return { success: true, name: entry.name, status };
     } catch (err) {
       await auditLogger.log({ action, user, details: String(err), success: false });
-      res.status(500).json({ success: false, error: String(err) });
+      return { success: false, error: String(err), name: entry.name };
     }
+  };
+
+  const setBtsBlocked = (blocked: boolean) => async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const state = loadGsmState();
+    const idx = state.btsEntries.findIndex(e => e.id === req.params.id);
+    if (idx === -1) { res.status(404).json({ success: false, error: 'BTS entry not found' }); return; }
+    const result = await blockBtsByIdx(idx, blocked, user);
+    if (!result.success) {
+      res.status(result.status ? 502 : 500).json({ success: false, error: result.error, ...(result.status ?? {}) });
+      return;
+    }
+    res.json({ success: true, ...result.status });
   };
   router.post('/bts/:id/block', requireAdmin, setBtsBlocked(true));
   router.post('/bts/:id/unblock', requireAdmin, setBtsBlocked(false));
+
+  // POST /api/gsm/bts/block-all — bulk-lock every configured BTS at once, the
+  // 2G equivalent of radio-block's/gnb-block's 4G/5G "Block RAN" kill switch.
+  // Deliberately NOT the same mechanism: those are mild, host-only nftables
+  // rules that never touch the radio itself; this reuses the SAME real
+  // osmo-bsc OML admin-lock as the single-BTS Block button above — every
+  // camped UE on every BTS drops immediately and each radio goes off the air
+  // (see Gsm2GBlockButton's own comment in RANPage.tsx for why the two are
+  // deliberately never visually conflated). Runs sequentially, not in
+  // parallel — each call already does its own command+verify round-trip
+  // against the same shared osmo-bsc VTY session. Skips entries already
+  // blocked rather than re-issuing the lock command, since the documented
+  // history here (see blockBtsByIdx's home comment above) is real hardware
+  // NACKing a bad command, not a stale flag — no reason to risk a redundant
+  // command against a BTS that's already confirmed locked.
+  router.post('/bts/block-all', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const state = loadGsmState();
+    const results: { id: string; name: string; success: boolean; error?: string }[] = [];
+    for (let idx = 0; idx < state.btsEntries.length; idx++) {
+      const entry = state.btsEntries[idx];
+      if (entry.blocked) { results.push({ id: entry.id, name: entry.name, success: true }); continue; }
+      const result = await blockBtsByIdx(idx, true, user);
+      results.push({ id: entry.id, name: entry.name, success: result.success, error: result.success ? undefined : result.error });
+    }
+    const allOk = results.every(r => r.success);
+    res.status(allOk ? 200 : 207).json({ success: allOk, results });
+  });
 
   // DELETE /api/gsm/bts/:id
   router.delete('/bts/:id', requireAdmin, async (req: Request, res: Response) => {

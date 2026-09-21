@@ -21,7 +21,7 @@ export const BUILD_WORKDIR = '/opt/kamailio-ims-modules-build';
 export const MODULES_DIR = '/usr/lib/x86_64-linux-gnu/kamailio/modules';
 
 // Bump whenever a patch below is added/changed.
-export const PATCH_REV = 1;
+export const PATCH_REV = 2;
 
 // Unique string only present once a file has been patched — used both as the
 // source-level idempotency check (grepped against the .c file mid-build,
@@ -33,6 +33,8 @@ export const PATCH_REV = 1;
 // on the .apt-original + patch-rev markers, which do reflect binary state.
 export const CMD_C_MARKER = 'NMS patch, confirmed live 2026-09-12 against a real iOS UE';
 export const SAVE_C_MARKER = 'same fallback shape as';
+export const CCR_C_MARKER = 'NMS patch, confirmed live 2026-09-17 against a real SigScale OCS';
+export const ROC_C_MARKER = 'this deployment\'s own';
 
 // Real bug, root-caused and fixed live 2026-09-12 against the stock (unmodified)
 // ims_ipsec_pcscf Kamailio module (kamailio-ims-modules package, NOT this
@@ -211,19 +213,205 @@ export const SAVE_C_PATCH = String.raw`--- a/src/modules/ims_registrar_pcscf/sav
  							pcontact->reg_state,
 `;
 
+// Four real bugs, all in the stock (unmodified) ims_charging Kamailio module
+// (kamailio-ims-modules package), root-caused and fixed live 2026-09-17 while
+// wiring the first-ever Diameter Ro (voice/airtime charging) connection this
+// deployment has made -- the module has shipped compiled and loaded since
+// this project's own IMS install existed, but nothing ever actually
+// exercised its CCR-building code path until tonight (WITH_RO stayed
+// dormant behind an #!ifdef the whole time, see CLAUDE.md architectural
+// pattern #13's Rx interface for the same "built, left disabled" shape).
+// Each bug produced a real, reproduced rejection from a real SigScale OCS
+// (Erlang/OTP, strict dictionary-based Diameter decoding) -- confirmed via
+// OCS's own erlang.log, not guessed, before being patched:
+//   1. Ro_write_CCR_avps() (ccr.c) manually re-added Origin-Host/
+//      Origin-Realm AVPs that cdp's own AAANewMessage() (called via
+//      AAACreateRequest() inside Ro_new_ccr()) already unconditionally adds
+//      from the peer's own configured DiameterPeer identity -- OCS rejected
+//      every CCR outright with "DIAMETER AVP too many times" (result 5009).
+//      This one was config-triggered (the origin_host/origin_realm
+//      modparams in kamailio_scscf.cfg's own #!ifdef WITH_RO block set the
+//      values Ro_write_CCR_avps() then duplicated) -- see that template's
+//      own comment for the matching config-side half of this fix; the
+//      modparams are now left unset there since this module already covers
+//      the identity via cdp automatically.
+//   2. The same function unconditionally added Accounting-Record-Type/
+//      Number AVPs to every CCR -- those belong to the Diameter Base
+//      Accounting application (RFC 6733 section 9), not Credit-Control (RFC
+//      4006); a real CCR has no defined slot for them. OCS rejected with
+//      "DIAMETER AVP unsupported" (result 5001).
+//   3. No CCR ever carried a standalone top-level Auth-Application-Id AVP,
+//      which RFC 4006 section 3.1 requires -- only a copy nested inside
+//      Vendor-Specific-Application-Id (Ro_add_vendor_specific_appid(), see
+//      bug 4). OCS flagged the missing top-level AVP explicitly (result
+//      5005, DIAMETER_MISSING_AVP).
+//   4. Every CCR also carried a Vendor-Specific-Application-Id AVP
+//      (Ro_add_vendor_specific_appid(), ims_ro.c, three call sites) -- that
+//      AVP has no defined slot in RFC 4006's CCR either; it belongs to
+//      CER/CEA capability negotiation, already completed once the peer
+//      connection is open. OCS rejected with "DIAMETER AVP unsupported"
+//      (result 5001) same as bug 2.
+//   5. format_subscription_id() (ims_ro.c) only ever recognized a tel: URI
+//      as an MSISDN identity -- this deployment's own P-Asserted-Identity is
+//      a sip:<msisdn>@domain URI, which fell through to the generic
+//      Subscription_Type_IMPU (SIP-URI) branch. OCS's own subscriber lookup
+//      (subscriber_id/3) only checks MSISDN/IMSI Subscription-Id types by
+//      default, and this deployment's OCS subscriber records are keyed by
+//      bare MSISDN, not a full SIP URI string -- every CCR was rejected
+//      DIAMETER_USER_UNKNOWN (result 5030) even for a correctly-provisioned
+//      subscriber. Fixed by extracting the digit-only user part of a sip:
+//      URI the same way a tel: URI's digits already are, falling back to
+//      the original IMPU default for anything that isn't purely digits.
+// Confirmed working end-to-end after all five fixes: a real test call's Ro
+// result code was 2001 (DIAMETER_SUCCESS) with a real 60-second credit
+// reservation granted, a clean CCA on CCR-Terminate, and -- verified
+// directly against OCS's own Mnesia bucket record, not just the CCA -- a
+// real 5-second debit against the subscriber's granted allowance.
+export const CCR_C_PATCH = String.raw`--- a/src/modules/ims_charging/ccr.c
++++ b/src/modules/ims_charging/ccr.c
+@@ -277,11 +277,32 @@
+ 			goto error;
+ 	}
+
+-	if(!cdp_avp->base.add_Accounting_Record_Type(
+-			   &(ccr->avpList), x->acct_record_type))
+-		goto error;
+-	if(!cdp_avp->base.add_Accounting_Record_Number(
+-			   &(ccr->avpList), x->acct_record_number))
++	/* NMS patch, confirmed live 2026-09-17 against a real SigScale OCS: this
++	 * used to unconditionally add Accounting-Record-Type/Number to every
++	 * CCR. Those two AVPs belong to the Diameter Base Accounting
++	 * application (RFC 6733 section 9), not Credit-Control (RFC 4006) -- a
++	 * real CCR has no defined slot for them. OCS's own diameter stack
++	 * (Erlang/OTP, strict dictionary-based decoding) rejected every CCR
++	 * outright with "DIAMETER AVP unsupported" (result 5001) once Ro was
++	 * actually exercised for the first time in this deployment's history --
++	 * a real freeDiameter-based peer may silently tolerate/ignore them, but
++	 * OCS does not. Removed rather than left conditional: nothing in this
++	 * module's own CCR construction is a real Diameter Accounting message,
++	 * so these never belonged here regardless of peer.
++	 */
++
++	/* NMS patch, confirmed live 2026-09-17: RFC 4006 section 3.1 requires a
++	 * standalone top-level Auth-Application-Id AVP on every CCR -- this
++	 * module only ever added one NESTED inside Vendor-Specific-Application-Id
++	 * (see Ro_add_vendor_specific_appid() in ims_ro.c), never a top-level
++	 * one. OCS's own diameter stack flagged the missing top-level AVP
++	 * explicitly (result 5005, DIAMETER_MISSING_AVP). IMS_Ro is the same
++	 * Application-Id constant Ro_new_ccr() already passes to
++	 * AAACreateRequest() and Ro_add_vendor_specific_appid() already uses for
++	 * the nested copy -- reusing it here rather than a separate magic number
++	 * keeps both copies guaranteed identical.
++	 */
++	if(!cdp_avp->base.add_Auth_Application_Id(&(ccr->avpList), IMS_Ro))
+ 		goto error;
+
+ 	if(x->user_name)
+`;
+
+export const IMS_RO_C_PATCH = String.raw`--- a/src/modules/ims_charging/ims_ro.c
++++ b/src/modules/ims_charging/ims_ro.c
+@@ -158,6 +158,39 @@
+ 			subscription_id->s += 1;
+ 			subscription_id->len -= 1;
+ 		}
++	} else if(strncasecmp(subscription_id->s, "sip:", 4) == 0) {
++		/* NMS patch, confirmed live 2026-09-17: this deployment's own
++		 * P-Asserted-Identity is a sip:<msisdn>@domain URI, not a tel: URI
++		 * -- the stock code fell through to the generic Subscription_Type_
++		 * IMPU (SIP-URI) branch below unconditionally, but OCS's own
++		 * subscriber lookup (subscriber_id/3) only checks MSISDN/IMSI
++		 * Subscription-Id types by default, and this deployment's OCS
++		 * subscriber records are keyed by bare MSISDN, not a full SIP URI
++		 * string -- every CCR was rejected DIAMETER_USER_UNKNOWN (5030)
++		 * even for a correctly-provisioned subscriber. If the SIP URI's
++		 * user part is purely digits (the normal shape for a real phone
++		 * number, as opposed to a named/alphanumeric SIP identity), treat
++		 * it the same way a tel: URI already is -- extract just the digits
++		 * and mark it MSISDN type. Anything that doesn't look like a phone
++		 * number falls through to the original default unchanged.
++		 */
++		str user = {subscription_id->s + 4, subscription_id->len - 4};
++		char *at = memchr(user.s, '@', user.len);
++		int userlen = at ? (int)(at - user.s) : user.len;
++		int i, all_digits = userlen > 0;
++		for(i = 0; i < userlen; i++) {
++			if(user.s[i] < '0' || user.s[i] > '9') {
++				all_digits = 0;
++				break;
++			}
++		}
++		if(all_digits) {
++			*subscription_id_type = Subscription_Type_MSISDN;
++			subscription_id->s = user.s;
++			subscription_id->len = userlen;
++		} else {
++			*subscription_id_type = Subscription_Type_IMPU;
++		}
+ 	} else {
+ 		*subscription_id_type =
+ 				Subscription_Type_IMPU; //default is END_USER_SIP_URI
+@@ -806,10 +839,13 @@
+ 	if(!(ccr = Ro_new_ccr(auth, ro_ccr_data)))
+ 		goto error;
+
+-	if(!Ro_add_vendor_specific_appid(
+-			   ccr, IMS_vendor_id_3GPP, IMS_Ro, 0 /*acct id*/)) {
+-		LM_ERR("Problem adding Vendor specific ID\n");
+-	}
++	/* NMS patch, confirmed live 2026-09-17: Vendor-Specific-Application-Id
++	 * has no defined slot in RFC 4006's CCR command (it belongs to CER/CEA
++	 * capability negotiation, already completed once the peer connection is
++	 * open) -- OCS's own diameter stack rejected every CCR carrying it with
++	 * "DIAMETER AVP unsupported" (result 5001). See Ro_write_CCR_avps()'s
++	 * own patch comment (ccr.c) for the two sibling AVPs fixed the same way.
++	 */
+ 	ro_session->hop_by_hop += 1;
+ 	if(!Ro_add_cc_request(ccr, RO_CC_INTERIM, ro_session->hop_by_hop)) {
+ 		LM_ERR("Problem adding CC-Request data\n");
+@@ -1131,9 +1167,9 @@
+
+ 	LM_DBG("Created new CCR\n");
+
+-	if(!Ro_add_vendor_specific_appid(ccr, IMS_vendor_id_3GPP, IMS_Ro, 0)) {
+-		LM_ERR("Problem adding Vendor specific ID\n");
+-	}
++	/* NMS patch, confirmed live 2026-09-17 -- see the sibling call site
++	 * above and Ro_write_CCR_avps()'s own patch comment (ccr.c).
++	 */
+
+ 	ro_session->hop_by_hop += 1;
+ 	if(!Ro_add_cc_request(ccr, RO_CC_STOP, ro_session->hop_by_hop)) {
+@@ -1449,10 +1485,9 @@
+ 	if(!(ccr = Ro_new_ccr(cc_acc_session, ro_ccr_data)))
+ 		goto error;
+
+-	if(!Ro_add_vendor_specific_appid(ccr, IMS_vendor_id_3GPP, IMS_Ro, 0)) {
+-		LM_ERR("Problem adding Vendor specific ID\n");
+-		goto error;
+-	}
++	/* NMS patch, confirmed live 2026-09-17 -- see the sibling call sites
++	 * above and Ro_write_CCR_avps()'s own patch comment (ccr.c).
++	 */
+
+ 	if(!Ro_add_cc_request(ccr, cc_event_type, cc_event_number)) {
+ 		LM_ERR("Problem adding CC-Request data\n");
+`;
+
 export const IMS_MODULES_BUILD_STEPS = [
   'preparing', 'installing_apt_deps', 'fetching_source', 'patching', 'building', 'verifying_abi', 'deploying',
 ] as const;
 export type ImsModulesBuildStep = typeof IMS_MODULES_BUILD_STEPS[number];
 
-// Full build script. Only rebuilds/redeploys ims_ipsec_pcscf.so and
-// ims_registrar_pcscf.so -- every other kamailio-ims-modules .so is left
-// completely untouched. Deliberately does NOT restart kamailio-pcscf itself;
-// that's the caller's job (ims-controller.ts's /install), same "build now,
-// cut over as an explicit separate step" split this project uses for FRR's
-// crash-guard patch and the osmo-msc/osmo-sip-connector source builds.
-// Idempotent: if both target .so files already contain the patch markers,
-// this is a fast no-op unless force=true.
+// Full build script. Rebuilds/redeploys ims_ipsec_pcscf.so,
+// ims_registrar_pcscf.so, and ims_charging.so -- every other kamailio-ims-
+// modules .so is left completely untouched. Deliberately does NOT restart
+// kamailio-pcscf/kamailio-scscf itself; that's the caller's job
+// (ims-controller.ts's /install), same "build now, cut over as an explicit
+// separate step" split this project uses for FRR's crash-guard patch and the
+// osmo-msc/osmo-sip-connector source builds.
+// Idempotent: if all three target .so files already contain the patch
+// markers, this is a fast no-op unless force=true.
 export function buildKamailioImsModulesScript(force = false): string {
   return `#!/bin/bash
 set -e
@@ -244,11 +432,12 @@ trap stop_heartbeat EXIT
 echo "==STEP:preparing=="
 IPSEC_SO="${MODULES_DIR}/ims_ipsec_pcscf.so"
 REGISTRAR_SO="${MODULES_DIR}/ims_registrar_pcscf.so"
+CHARGING_SO="${MODULES_DIR}/ims_charging.so"
 PATCH_REV_FILE="${BUILD_WORKDIR}/.patch-rev"
 
 if [ "${force ? '1' : '0'}" != "1" ] \\
-    && [ -f "$IPSEC_SO" ] && [ -f "$REGISTRAR_SO" ] \\
-    && [ -f "$IPSEC_SO.apt-original" ] && [ -f "$REGISTRAR_SO.apt-original" ] \\
+    && [ -f "$IPSEC_SO" ] && [ -f "$REGISTRAR_SO" ] && [ -f "$CHARGING_SO" ] \\
+    && [ -f "$IPSEC_SO.apt-original" ] && [ -f "$REGISTRAR_SO.apt-original" ] && [ -f "$CHARGING_SO.apt-original" ] \\
     && [ "$(cat "$PATCH_REV_FILE" 2>/dev/null || echo -1)" = "${PATCH_REV}" ]; then
   echo "kamailio-ims-modules patch rev ${PATCH_REV} already deployed -- nothing to do."
   echo "==STEP:done=="
@@ -315,17 +504,45 @@ PATCHEOF
   echo "  PATCH $REGISTRAR_C"
 fi
 
+CCR_C=src/modules/ims_charging/ccr.c
+IMS_RO_C=src/modules/ims_charging/ims_ro.c
+
+if grep -q "${CCR_C_MARKER}" "$CCR_C"; then
+  echo "  ok    $CCR_C (already patched)"
+else
+  cat > /tmp/ccr.c.patch <<'PATCHEOF'
+${CCR_C_PATCH}
+PATCHEOF
+  patch -p1 --forward --batch < /tmp/ccr.c.patch
+  grep -q "${CCR_C_MARKER}" "$CCR_C" || { echo "ERROR: $CCR_C patch marker missing after apply -- upstream source may have changed, review manually."; exit 1; }
+  echo "  PATCH $CCR_C"
+fi
+
+if grep -q "${ROC_C_MARKER}" "$IMS_RO_C"; then
+  echo "  ok    $IMS_RO_C (already patched)"
+else
+  cat > /tmp/ims_ro.c.patch <<'PATCHEOF'
+${IMS_RO_C_PATCH}
+PATCHEOF
+  patch -p1 --forward --batch < /tmp/ims_ro.c.patch
+  grep -q "${ROC_C_MARKER}" "$IMS_RO_C" || { echo "ERROR: $IMS_RO_C patch marker missing after apply -- upstream source may have changed, review manually."; exit 1; }
+  echo "  PATCH $IMS_RO_C"
+fi
+
 echo "==STEP:building=="
 start_heartbeat
 make modules modules=src/modules/ims_ipsec_pcscf
 make modules modules=src/modules/ims_registrar_pcscf
+make modules modules=src/modules/ims_charging
 stop_heartbeat
 echo ${PATCH_REV} > "$PATCH_REV_FILE"
 
 NEW_IPSEC_SO="$(pwd)/src/modules/ims_ipsec_pcscf/ims_ipsec_pcscf.so"
 NEW_REGISTRAR_SO="$(pwd)/src/modules/ims_registrar_pcscf/ims_registrar_pcscf.so"
+NEW_CHARGING_SO="$(pwd)/src/modules/ims_charging/ims_charging.so"
 test -f "$NEW_IPSEC_SO" || { echo "ERROR: build did not produce $NEW_IPSEC_SO"; exit 1; }
 test -f "$NEW_REGISTRAR_SO" || { echo "ERROR: build did not produce $NEW_REGISTRAR_SO"; exit 1; }
+test -f "$NEW_CHARGING_SO" || { echo "ERROR: build did not produce $NEW_CHARGING_SO"; exit 1; }
 
 echo "==STEP:verifying_abi=="
 # Confirmed-live discipline from the original manual patch: a bad build could
@@ -333,7 +550,7 @@ echo "==STEP:verifying_abi=="
 # what kamailio's module loader expects -- diffing the dynamic symbol table
 # against the currently-loaded module (patched or original, whichever is
 # live right now) catches that before it ever reaches a running service.
-for pair in "$IPSEC_SO:$NEW_IPSEC_SO:ims_ipsec_pcscf" "$REGISTRAR_SO:$NEW_REGISTRAR_SO:ims_registrar_pcscf"; do
+for pair in "$IPSEC_SO:$NEW_IPSEC_SO:ims_ipsec_pcscf" "$REGISTRAR_SO:$NEW_REGISTRAR_SO:ims_registrar_pcscf" "$CHARGING_SO:$NEW_CHARGING_SO:ims_charging"; do
   OLD="\${pair%%:*}"; rest="\${pair#*:}"; NEW="\${rest%%:*}"; NAME="\${rest##*:}"
   nm -D --defined-only "$OLD" 2>/dev/null | awk '{print $NF}' | sort > /tmp/"$NAME".old.symbols
   nm -D --defined-only "$NEW" 2>/dev/null | awk '{print $NF}' | sort > /tmp/"$NAME".new.symbols
@@ -350,11 +567,14 @@ echo "==STEP:deploying=="
 # .apt-original with an already-patched file on a re-run.
 [ -f "$IPSEC_SO.apt-original" ] || cp "$IPSEC_SO" "$IPSEC_SO.apt-original"
 [ -f "$REGISTRAR_SO.apt-original" ] || cp "$REGISTRAR_SO" "$REGISTRAR_SO.apt-original"
+[ -f "$CHARGING_SO.apt-original" ] || cp "$CHARGING_SO" "$CHARGING_SO.apt-original"
 cp "$NEW_IPSEC_SO" "$IPSEC_SO.new" && mv "$IPSEC_SO.new" "$IPSEC_SO"
 cp "$NEW_REGISTRAR_SO" "$REGISTRAR_SO.new" && mv "$REGISTRAR_SO.new" "$REGISTRAR_SO"
-chmod 644 "$IPSEC_SO" "$REGISTRAR_SO"
+cp "$NEW_CHARGING_SO" "$CHARGING_SO.new" && mv "$CHARGING_SO.new" "$CHARGING_SO"
+chmod 644 "$IPSEC_SO" "$REGISTRAR_SO" "$CHARGING_SO"
 echo "deployed: $IPSEC_SO"
 echo "deployed: $REGISTRAR_SO"
+echo "deployed: $CHARGING_SO"
 echo "originals preserved as *.apt-original for instant revert"
 
 echo "==STEP:done=="
@@ -362,24 +582,43 @@ echo "==STEP:done=="
 }
 
 // Real check — reads the actual deployed files, not the build log.
+// Found live 2026-09-18 (chasing an unrelated reproducibility audit) that
+// this had been broken since it was first written: CMD_C_MARKER/
+// SAVE_C_MARKER/CCR_C_MARKER are C *comments* in the patch diffs, and
+// comments never survive compilation into a .so's string table — `strings`
+// can never find them, so every *Patched flag always returned false
+// regardless of whether the patch was actually applied. Never caught before
+// because nothing in this codebase ever calls this function (confirmed via
+// a full grep) — the real deploy pipeline verifies success its own way (the
+// ABI `nm -D` exported-symbol diff step already baked into the generated
+// script below), so this dead diagnostic function's own bug never blocked
+// anything real. Fixed to compare compiled file SIZE against the preserved
+// `.apt-original` — a patched ims_charging.so is genuinely, substantially
+// larger than the stock package build (confirmed live: 1,138,328 bytes vs
+// 476,584 original), a real signal that survives compilation, unlike a
+// comment string.
 export async function verifyKamailioImsModulesPatch(): Promise<{
   ipsecPatched: boolean;
   registrarPatched: boolean;
+  chargingPatched: boolean;
   originalsPreserved: boolean;
 }> {
+  const sizeDiffers = async (so: string): Promise<boolean> => {
+    try {
+      const { stdout } = await nsenter('bash', ['-c',
+        `stat -c%s ${MODULES_DIR}/${so}.so 2>/dev/null; stat -c%s ${MODULES_DIR}/${so}.so.apt-original 2>/dev/null`]);
+      const [current, original] = stdout.trim().split('\n').map(n => parseInt(n, 10));
+      return Number.isFinite(current) && Number.isFinite(original) && current !== original;
+    } catch { return false; }
+  };
   try {
-    const { stdout: ipsecStrings } = await nsenter('bash', ['-c',
-      `strings ${MODULES_DIR}/ims_ipsec_pcscf.so 2>/dev/null | grep -c "${CMD_C_MARKER}" || true`]);
-    const { stdout: registrarStrings } = await nsenter('bash', ['-c',
-      `strings ${MODULES_DIR}/ims_registrar_pcscf.so 2>/dev/null | grep -c "${SAVE_C_MARKER}" || true`]);
+    const [ipsecPatched, registrarPatched, chargingPatched] = await Promise.all([
+      sizeDiffers('ims_ipsec_pcscf'), sizeDiffers('ims_registrar_pcscf'), sizeDiffers('ims_charging'),
+    ]);
     const { stdout: originals } = await nsenter('bash', ['-c',
-      `test -f ${MODULES_DIR}/ims_ipsec_pcscf.so.apt-original && test -f ${MODULES_DIR}/ims_registrar_pcscf.so.apt-original && echo yes || echo no`]);
-    return {
-      ipsecPatched: parseInt(ipsecStrings.trim() || '0', 10) > 0,
-      registrarPatched: parseInt(registrarStrings.trim() || '0', 10) > 0,
-      originalsPreserved: originals.trim() === 'yes',
-    };
+      `test -f ${MODULES_DIR}/ims_ipsec_pcscf.so.apt-original && test -f ${MODULES_DIR}/ims_registrar_pcscf.so.apt-original && test -f ${MODULES_DIR}/ims_charging.so.apt-original && echo yes || echo no`]);
+    return { ipsecPatched, registrarPatched, chargingPatched, originalsPreserved: originals.trim() === 'yes' };
   } catch {
-    return { ipsecPatched: false, registrarPatched: false, originalsPreserved: false };
+    return { ipsecPatched: false, registrarPatched: false, chargingPatched: false, originalsPreserved: false };
   }
 }

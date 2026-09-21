@@ -600,7 +600,17 @@ WantedBy=multi-user.target
 // ── Host-side helpers ─────────────────────────────────────────────────────
 
 async function ensureDirTreeAndOwnership(): Promise<void> {
-  const dirs = [A2G_ETC, A2G_VARLIB, `${A2G_VARLIB}/agi-bin`, A2G_SPOOL, A2G_LOG, A2G_CACHE];
+  // Real bug, confirmed live 2026-09-17: cdr_csv.so does not create its own
+  // cdr-csv/ subdirectory under astlogdir — it only ever fopen()s the file,
+  // so every CDR write silently failed ("Unable to open file ... No such
+  // file or directory" in this instance's own debug.log) despite the CDR
+  // engine itself reporting "Enabled" and real calls reaching the dialplan.
+  // The PSTN Gateway's own Asterisk instance never hit this because its
+  // astlogdir is the untouched OS-package default (/var/log/asterisk),
+  // which already ships this subdirectory; this instance's isolated
+  // astlogdir (A2G_LOG) needs it created explicitly, same as every other
+  // directory in this list.
+  const dirs = [A2G_ETC, A2G_VARLIB, `${A2G_VARLIB}/agi-bin`, A2G_SPOOL, A2G_LOG, `${A2G_LOG}/cdr-csv`, A2G_CACHE];
   await nsenter('bash', ['-c', `mkdir -p ${dirs.join(' ')} && chown -R asterisk:asterisk ${dirs.join(' ')}`]);
   fs.mkdirSync(`${HOST_ROOT}/etc/tmpfiles.d`, { recursive: true });
   fs.writeFileSync(`${HOST_ROOT}${TMPFILES_PATH}`, asterisk2gTmpfilesLine(), 'utf-8');

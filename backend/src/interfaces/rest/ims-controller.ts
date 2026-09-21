@@ -15,6 +15,8 @@ import { loadState as loadVowifiState } from './vowifi-controller';
 import { buildSmfLateCsrPatchScript } from '../../application/use-cases/smf-late-csr-patch';
 import { buildKamailioImsModulesScript } from '../../application/use-cases/kamailio-ims-modules-build';
 import { VECTORCORE_SMSC_SIP_ADDRESS } from './vectorcore-smsc-controller';
+import { getOcsPeerInfo, addOcsDiameterClient } from './ocs-controller';
+import { formatPstnDispatcherEntry } from './pstn-controller';
 
 const execFileAsync = promisify(execFile);
 
@@ -248,6 +250,53 @@ function readMccMnc(): { mcc: string; mnc: string } {
   return { mcc, mnc };
 }
 
+// cdp (Kamailio's own Diameter module) resolves a <Peer FQDN="..."/> via a
+// real getaddrinfo() at connect time — same synchronous-DNS-or-die behavior
+// CLAUDE.md's gotcha #6 documents for every 5GC NF's own advertise FQDN,
+// just for cdp instead. OCS's FQDN (ocs.epc.mnc...) lives under the EPC
+// domain — this file's own IMS zone (bindZoneFile(), step 10 in
+// configureIms()) doesn't cover it, but BIND already serves a real,
+// authoritative "epc.mnc<mnc>.mcc<mcc>.3gppnetwork.org" zone (set up by the
+// DNS/FQDN Migration Wizard) with A records for hss/mme/smf/pcrf/aaa/secgw —
+// this just adds "ocs" to that same zone, mirroring secgw-controller.ts's
+// own upsertSecgwDnsRecord()/upsertZoneRecordLine() pattern (itself copied
+// from vowifi-controller.ts) for merging exactly one record into a zone file
+// wholesale-owned by the Migration Wizard (CLAUDE.md gotcha #4) — never
+// rewrite the whole file. An earlier draft of this fix used a raw /etc/hosts
+// entry instead — it worked, but duplicated DNS infrastructure this project
+// already has for exactly this purpose, caught in review before shipping.
+// `rndc reload` (not a full `systemctl restart bind9`, secgw's own choice)
+// matches this file's own existing convention (see step 16's "Reload bind9
+// zone after restart" comment) and avoids a momentary DNS outage for every
+// other module sharing this same BIND instance. Best-effort/non-fatal if the
+// epc zone doesn't exist yet (BIND never installed, or the Migration Wizard
+// never run) — same graceful-degrade convention as secgw's own upsert.
+async function upsertOcsDnsRecord(mcc: string, mnc: string, ocsIp: string): Promise<void> {
+  const zonePath = `${HOST_BIND_ZONES_DIR}/${deriveEpcDomain(mcc, mnc)}.zone`;
+  if (!fs.existsSync(zonePath)) return;
+  const raw = fs.readFileSync(zonePath, 'utf-8');
+  const lineRe = /^ocs\s+IN\s+A\s+\S+\s*$/m;
+  const line = `ocs IN A ${ocsIp}`;
+  const updated = lineRe.test(raw) ? raw.replace(lineRe, line) : raw.trimEnd() + '\n' + line + '\n';
+  if (updated === raw) return;
+  fs.writeFileSync(zonePath, updated, 'utf-8');
+  await nsenter('rndc', ['reload']).catch(() => {});
+}
+
+// The IP to register as S-CSCF's trusted OCS Diameter client identity.
+// Deliberately NOT scscfIp — confirmed live (2026-09-17): cdp's own
+// peer_connect() doesn't bind its outbound TCP connection to the configured
+// <Peer>'s own listen address before connecting out to OCS, so even though
+// S-CSCF listens on its own dedicated loopback alias (127.0.1.2), OCS
+// observes the connection arriving from plain 127.0.0.1 — registering
+// scscfIp as the client produced a real, reproduced "DIAMETER peer address
+// not found in client table" (result 3010) rejection with OCS's own log
+// showing `addresses: [{127,0,0,1}]`, not scscfIp. This is a difference
+// from freeDiameter (SMF's Gy peer, and every other freeDiameter-based
+// module here) which DOES source outbound connections from its own
+// configured ListenOn address — cdp simply doesn't offer an equivalent bind.
+const OCS_CLIENT_SOURCE_IP = '127.0.0.1';
+
 // ── Kamailio include-file templates (written by Configure) ───────────────────
 
 function pcscfIncludeCfg(p: { pcscfIp: string; pcscfPort: number; imsDomain: string; epcDomain: string; additionalDomains?: string[] }): string {
@@ -319,7 +368,7 @@ function pcscfDispatcherList(icscfIp: string, icscfPort: number): string {
   return `1 sip:${icscfIp}:${icscfPort}\n`;
 }
 
-function scscfIncludeCfg(p: { scscfIp: string; scscfPort: number; imsDomain: string; additionalDomains?: string[]; blockImsSms?: boolean; routeSmsToVectorcore?: { ip: string; port: number } }): string {
+function scscfIncludeCfg(p: { scscfIp: string; scscfPort: number; imsDomain: string; additionalDomains?: string[]; blockImsSms?: boolean; routeSmsToVectorcore?: { ip: string; port: number }; voiceCharging?: { ocsOriginHost: string }; cdrAccounting?: boolean }): string {
   const extraAliases = (p.additionalDomains ?? []).map(d => `alias=scscf.${d}`).join('\n');
   // BLOCK_IMS_SMS gates the hard-reject rule in the static kamailio_scscf.cfg
   // template (search for BLOCK_IMS_SMS there) — the "SMS delivery mode"
@@ -343,6 +392,48 @@ function scscfIncludeCfg(p: { scscfIp: string; scscfPort: number; imsDomain: str
   const routeSmsToVectorcore = p.routeSmsToVectorcore
     ? `#!define ROUTE_SMS_TO_VECTORCORE\n#!define VECTORCORE_SMSC_IP "${p.routeSmsToVectorcore.ip}"\n#!define VECTORCORE_SMSC_PORT "${p.routeSmsToVectorcore.port}"\n`
     : '';
+  // Voice/airtime charging (Diameter Ro, via Kamailio's own ims_charging
+  // module) — completes the block kamailio_scscf.cfg has carried dormant
+  // behind #!ifdef WITH_RO/WITH_RO_TERM since before this project's own
+  // history began (ims_charging.so is already compiled+loadmodule'd
+  // unconditionally; only the modparam block and the Ro_CCR() call sites
+  // were ever gated). origin_host/origin_realm modparams in the static
+  // template reference the bare HOSTNAME/NETWORKNAME macros already defined
+  // above — no new variables needed for those two. RO_ROOT deliberately
+  // stays at ims_charging's own compiled-in default ("32260@3gpp.org", the
+  // standard MMTel Service-Context-Id) rather than being derived from this
+  // deployment's own 3gppnetwork.org PLMN domain — confirmed by reading the
+  // module's C source (ims_charging_mod.c) that OCS's service_type/1
+  // parser only inspects the LAST 14 bytes of the assembled string
+  // (a 5-digit code + "@3gpp.org", literally, not "3gppnetwork.org"), so a
+  // "PLMN-flavored" root would silently stop matching as IMS-voice on the
+  // OCS side. WITH_RO_TERM (charging the terminating/called leg too) is
+  // deliberately never enabled — this only charges the originating leg,
+  // matching standard "caller pays" billing convention, keeping the first
+  // version of this simple.
+  const voiceCharging = (() => {
+    if (!p.voiceCharging) return '';
+    const { mcc, mnc } = readMccMnc();
+    return [
+      `#!define WITH_RO`,
+      `#!define RO_FORCED_PEER "${p.voiceCharging.ocsOriginHost}"`,
+      `#!define RO_DESTINATION "${p.voiceCharging.ocsOriginHost}"`,
+      `#!define RO_MNC "${mnc.padStart(2, '0')}"`,
+      `#!define RO_MCC "${mcc.padStart(3, '0')}"`,
+      `#!define RO_ROOT "32260@3gpp.org"`,
+      `#!define RO_EXT "ext"`,
+      `#!define RO_RELEASE "8"`,
+      ``,
+    ].join('\n');
+  })();
+  // CDR Phase 3 — Kamailio's own `acc` module, basic flag-based accounting
+  // (db_flag/db_missed_flag), deliberately NOT acc's newer cdr_enable
+  // feature, which needs load_dlg_api() bound to a module literally named
+  // "dialog" — this deployment loads ims_dialog.so instead (a related but
+  // separate module, not a drop-in for that lookup), so cdr_enable is a real
+  // startup-failure risk here. See kamailio_scscf.cfg's own WITH_CDR block
+  // for the full modparam set and setflag() site.
+  const cdrAccounting = p.cdrAccounting ? '#!define WITH_CDR\n' : '';
   return `# Open5GS NMS — S-CSCF include (generated by Configure)
 listen=udp:${p.scscfIp}:${p.scscfPort}
 listen=tcp:${p.scscfIp}:${p.scscfPort}
@@ -362,7 +453,7 @@ ${extraAliases}
 #!substdef "/UE_REGISTRATION_EXPIRES/7200/g"
 #!define WITH_TCP
 #!define WITH_AUTH
-${blockImsSms}${routeSmsToVectorcore}`;
+${blockImsSms}${routeSmsToVectorcore}${voiceCharging}${cdrAccounting}`;
 }
 
 // ── Diameter XML templates ────────────────────────────────────────────────────
@@ -445,9 +536,16 @@ function icscfDiameterXml(p: { icscfIp: string; imsDomain: string }): string {
 `;
 }
 
-function scscfDiameterXml(p: { scscfIp: string; imsDomain: string }): string {
+function scscfDiameterXml(p: { scscfIp: string; imsDomain: string; ocsPeer?: { fqdn: string; port: number } }): string {
   // See icscfDiameterXml()'s comment — same DefaultRoute requirement applies here
-  // for S-CSCF's Cx (MAR/SAR) messages.
+  // for S-CSCF's Cx (MAR/SAR) messages. The OCS <Peer> (when voice charging is
+  // enabled) deliberately gets no <DefaultRoute> of its own — ims_charging's
+  // ro_forced_peer modparam (RO_FORCED_PEER, set in the generated include file)
+  // explicitly targets Ro CCR messages at it, bypassing cdp's routing table for
+  // that traffic entirely. Without the <Peer> entry itself, though, cdp never
+  // opens the CER/CEA connection in the first place — same requirement as every
+  // other peer in this file.
+  const ocsPeer = p.ocsPeer ? `\n  <Peer FQDN="${p.ocsPeer.fqdn}" port="${p.ocsPeer.port}"/>` : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <DiameterPeer
     FQDN="scscf.${p.imsDomain}"
@@ -470,7 +568,7 @@ function scscfDiameterXml(p: { scscfIp: string; imsDomain: string }): string {
   <SupportedVendor vendor="4491"/>
   <SupportedVendor vendor="13019"/>
   <Peer FQDN="hss.${p.imsDomain}" port="3868"/>
-  <DefaultRoute FQDN="hss.${p.imsDomain}" metric="10"/>
+  <DefaultRoute FQDN="hss.${p.imsDomain}" metric="10"/>${ocsPeer}
 </DiameterPeer>
 `;
 }
@@ -1728,7 +1826,18 @@ INSERT IGNORE INTO s_cscf_capabilities (id_s_cscf, capability)
   await mysqlExec(`GRANT ALL PRIVILEGES ON scscf.* TO 'scscf'@'127.0.0.1';`);
 
   // Use official Kamailio SQL files when available
-  await sourceKamSql('scscf', ['standard-create.sql', 'presence-create.sql', 'ims_usrloc_scscf-create.sql', 'ims_dialog-create.sql', 'ims_charging-create.sql']);
+  await sourceKamSql('scscf', ['standard-create.sql', 'presence-create.sql', 'ims_usrloc_scscf-create.sql', 'ims_dialog-create.sql', 'ims_charging-create.sql', 'acc-create.sql']);
+
+  // acc-create.sql's stock acc/missed_calls tables have no src_user/dst_user
+  // columns -- CDR Phase 3 (WITH_CDR) needs both via acc's own db_extra
+  // modparam. MariaDB 10.11 (confirmed installed) supports IF NOT EXISTS on
+  // ADD COLUMN directly, so this is safely re-runnable on every Configure
+  // without needing sourceKamSql()'s stderr-code-tolerance idiom.
+  await mysqlExec(`USE scscf;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS src_user VARCHAR(255) DEFAULT NULL;
+ALTER TABLE acc ADD COLUMN IF NOT EXISTS dst_user VARCHAR(255) DEFAULT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS src_user VARCHAR(255) DEFAULT NULL;
+ALTER TABLE missed_calls ADD COLUMN IF NOT EXISTS dst_user VARCHAR(255) DEFAULT NULL;`);
 
   // Fall-back hand-crafted tables (ignored if official files already created them)
   // Drop and recreate with correct ims_usrloc_scscf schema (previous schema was wrong)
@@ -2068,6 +2177,19 @@ export async function configureIms(input: ImsConfigureFullInput): Promise<{ imsD
   // above. Default 30s matches the reference project's original hardcoded
   // value.
   let smsWorkerIntervalSeconds = 30;
+  // Preserve the voice/airtime charging (Diameter Ro) toggle across a plain
+  // Configure re-run, same reason as smsDeliveryMode above — see
+  // setVoiceChargingEnabled() below. Defaults off: enabling it touches a
+  // currently-working, critical, live IMS component (S-CSCF) exactly the way
+  // the Gy toggle touched SMF during this same session's production
+  // incident — see CLAUDE.md's SigScale OCS / Charging Plans pattern entries.
+  let voiceChargingEnabled = false;
+  // Preserve the CDR accounting (Kamailio `acc` module, direct IMS-to-IMS
+  // call records) toggle across a plain Configure re-run, same reason as
+  // voiceChargingEnabled above — see setCdrAccountingEnabled() below.
+  // Defaults off: same live-S-CSCF blast radius as voiceChargingEnabled,
+  // though this one has no external-service dependency to re-heal.
+  let cdrAccountingEnabled = false;
   if (fs.existsSync(HOST_IMS_STATE)) {
     try {
       const prevSaved = JSON.parse(fs.readFileSync(HOST_IMS_STATE, 'utf-8'));
@@ -2080,7 +2202,37 @@ export async function configureIms(input: ImsConfigureFullInput): Promise<{ imsD
       if (prevPrimaryDomain) prevDomains.push(prevPrimaryDomain);
       removedDomains = [...new Set(prevDomains)].filter(d => d !== imsDomain && !additionalDomains.includes(d));
       if (prevSaved?.smsDeliveryMode === 'sgs' || prevSaved?.smsDeliveryMode === 'vectorcore') smsDeliveryMode = prevSaved.smsDeliveryMode;
+      if (prevSaved?.voiceChargingEnabled === true) voiceChargingEnabled = true;
+      if (prevSaved?.cdrAccountingEnabled === true) cdrAccountingEnabled = true;
     } catch { /* corrupt state — nothing to clean up */ }
+  }
+  // Fail-safe, not fail-loud, on a plain re-Configure: if the toggle was left
+  // on but OCS is no longer reachable (uninstalled, never configured), don't
+  // let a stale flag silently break the entire IMS stack's Configure run —
+  // degrade to "voice charging off" the same way a removed BIND forwarder or
+  // any other optional cross-module dependency degrades elsewhere in this
+  // file. The dedicated /voice-charging route below is the one place that
+  // DOES hard-fail when an operator explicitly tries to turn this on against
+  // an unavailable OCS, matching setSmsDeliveryMode()'s existing guard style.
+  let ocsPeerInfo = voiceChargingEnabled ? getOcsPeerInfo() : null;
+  if (voiceChargingEnabled && !ocsPeerInfo) voiceChargingEnabled = false;
+  // Re-heal S-CSCF's OCS Diameter client registration on every plain
+  // Configure too (not just inside setVoiceChargingEnabled() below) — mirrors
+  // configureOcs()'s own addSmfAsOcsClient() call, same idempotent-by-IP
+  // Mnesia upsert, in case OCS's own client table was ever reset
+  // independently of this toggle. A failure here downgrades this run to
+  // "voice charging off" rather than throwing — an optional add-on's peer
+  // hiccup must never fail the entire IMS Configure (P-CSCF/I-CSCF/SMS/etc.
+  // all restart from the same call), and writing scscf.cfg/scscf.xml with
+  // WITH_RO baked in while OCS doesn't actually trust S-CSCF as a client
+  // would be the fatal "looks configured, isn't" trap this session's Gy
+  // incident already demonstrated once tonight.
+  if (ocsPeerInfo) {
+    const clientResult = await addOcsDiameterClient(OCS_CLIENT_SOURCE_IP);
+    if (!clientResult.ok) {
+      ocsPeerInfo = null;
+      voiceChargingEnabled = false;
+    }
   }
 
   // 1. P-CSCF include config + Diameter XML
@@ -2106,9 +2258,15 @@ export async function configureIms(input: ImsConfigureFullInput): Promise<{ imsD
       scscfIp, scscfPort, imsDomain, additionalDomains,
       blockImsSms: smsDeliveryMode === 'sgs',
       routeSmsToVectorcore: smsDeliveryMode === 'vectorcore' ? VECTORCORE_SMSC_SIP_ADDRESS : undefined,
+      voiceCharging: ocsPeerInfo ? { ocsOriginHost: ocsPeerInfo.originHost } : undefined,
+      cdrAccounting: cdrAccountingEnabled,
     }), 'utf-8');
   fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/scscf.xml`,
-    scscfDiameterXml({ scscfIp, imsDomain }), 'utf-8');
+    scscfDiameterXml({
+      scscfIp, imsDomain,
+      ocsPeer: ocsPeerInfo ? { fqdn: ocsPeerInfo.originHost, port: ocsPeerInfo.port } : undefined,
+    }), 'utf-8');
+  if (ocsPeerInfo) await upsertOcsDnsRecord(mcc, mnc, ocsPeerInfo.bindIp);
 
   // 3b. SMSC config — Kamailio SMS center on port 7090
   const smscIp = pcscfIp; // SMSC runs on same host as P-CSCF
@@ -2143,7 +2301,21 @@ export async function configureIms(input: ImsConfigureFullInput): Promise<{ imsD
   fs.writeFileSync(`${HOST_KAMAILIO_PCSCF_DIR}/dispatcher.list`, pcscfDispatcherList(icscfIp, icscfPort), 'utf-8');
   deployImsTemplate('kamailio_icscf/kamailio_icscf.cfg', `${HOST_KAMAILIO_ICSCF_DIR}/kamailio_icscf.cfg`);
   deployImsTemplate('kamailio_scscf/kamailio_scscf.cfg', `${HOST_KAMAILIO_SCSCF_DIR}/kamailio_scscf.cfg`);
-  deployImsTemplate('kamailio_scscf/dispatcher.list', `${HOST_KAMAILIO_SCSCF_DIR}/dispatcher.list`);
+  // dispatcher.list is a file BOTH this module and pstn-controller.ts write
+  // to — PSTN Gateway owns the real dispatcher entry once configured (see
+  // formatPstnDispatcherEntry()'s own comment). Found live 2026-09-18: this
+  // used to unconditionally deploy the static placeholder template on every
+  // single Configure, silently wiping PSTN's own dispatcher entry (breaking
+  // every PSTN-routed call) the next time an operator re-ran a completely
+  // unrelated IMS Configure. Preserve PSTN's entry if it's currently
+  // configured; only fall back to the placeholder template on a deployment
+  // where PSTN was never set up (matches original/fresh-install behavior).
+  const pstnDispatcherEntry = formatPstnDispatcherEntry();
+  if (pstnDispatcherEntry) {
+    fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/dispatcher.list`, pstnDispatcherEntry, 'utf-8');
+  } else {
+    deployImsTemplate('kamailio_scscf/dispatcher.list', `${HOST_KAMAILIO_SCSCF_DIR}/dispatcher.list`);
+  }
   // Required by modparam("ims_registrar_scscf", "user_data_xsd", ...) — without
   // it, every SAA's iFC XML fails schema validation and the whole SIP REGISTER
   // fails with "500 Server error on UAR select next S-CSCF" once no more
@@ -2284,6 +2456,8 @@ export async function configureIms(input: ImsConfigureFullInput): Promise<{ imsD
     configuredWithVersion: prevConfiguredWithVersion,
     smsDeliveryMode,
     smsWorkerIntervalSeconds,
+    voiceChargingEnabled,
+    cdrAccountingEnabled,
     config: {
       mcc, mnc, additionalPlmns: additionalPlmns ?? [],
       pcscfIp, pcscfPort, icscfIp, icscfPort, scscfIp, scscfPort,
@@ -2382,12 +2556,22 @@ export async function setSmsDeliveryMode(mode: 'sgs' | 'ims' | 'vectorcore'): Pr
   const { scscfIp, scscfPort } = state.config;
   const imsDomain: string = state.imsDomain;
   const additionalDomains = (state.config.additionalPlmns ?? []).map((p: { mcc: string; mnc: string }) => deriveImsDomain(p.mcc, p.mnc));
+  // voiceChargingEnabled (see setVoiceChargingEnabled() below) and
+  // cdrAccountingEnabled (see setCdrAccountingEnabled() below) are two more
+  // independent toggles that regenerate this SAME scscf.cfg — both must be
+  // preserved here, or switching SMS delivery mode would silently regenerate
+  // the file with WITH_RO/WITH_CDR dropped even though state still claims
+  // they're on.
+  const ocsPeerInfo = state.voiceChargingEnabled === true ? getOcsPeerInfo() : null;
+  const cdrAccountingEnabled = state.cdrAccountingEnabled === true;
 
   fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/scscf.cfg`,
     scscfIncludeCfg({
       scscfIp, scscfPort, imsDomain, additionalDomains,
       blockImsSms: mode === 'sgs',
       routeSmsToVectorcore: mode === 'vectorcore' ? VECTORCORE_SMSC_SIP_ADDRESS : undefined,
+      cdrAccounting: cdrAccountingEnabled,
+      voiceCharging: ocsPeerInfo ? { ocsOriginHost: ocsPeerInfo.originHost } : undefined,
     }), 'utf-8');
   await nsenter('systemctl', ['restart', 'kamailio-scscf']);
 
@@ -2401,6 +2585,108 @@ export async function setSmsDeliveryMode(mode: 'sgs' | 'ims' | 'vectorcore'): Pr
     defaultIfcXml(imsDomain, mode === 'vectorcore' ? VECTORCORE_SMSC_SIP_ADDRESS : undefined), 'utf-8');
 
   state.smsDeliveryMode = mode;
+  fs.writeFileSync(HOST_IMS_STATE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+// Toggles voice/airtime charging (Diameter Ro, via Kamailio's own
+// ims_charging module) on the S-CSCF — completes the block
+// kamailio_scscf.cfg has carried dormant behind #!ifdef WITH_RO since before
+// this project's own history began (see scscfIncludeCfg()'s own comment for
+// the full research). Deliberately the same shape as setSmsDeliveryMode()
+// above: regenerates only the S-CSCF include file + Diameter XML and
+// restarts that one service, not a full re-Configure of the whole IMS
+// stack. Unlike configureIms()'s own fail-safe degrade-to-off handling of a
+// stale flag, turning this ON here hard-fails immediately if OCS isn't
+// configured or the client registration doesn't succeed — this is the one
+// deliberate operator action point where silent degradation would hide a
+// real problem instead of surfacing it. Turning it OFF never depends on OCS
+// at all, so the feature can always be disabled even if OCS itself is down.
+export async function setVoiceChargingEnabled(enabled: boolean): Promise<void> {
+  if (!fs.existsSync(HOST_IMS_STATE)) {
+    throw new Error('IMS is not configured yet — configure IMS first');
+  }
+  const state = JSON.parse(fs.readFileSync(HOST_IMS_STATE, 'utf-8'));
+  const { scscfIp, scscfPort } = state.config;
+  const imsDomain: string = state.imsDomain;
+  const additionalDomains = (state.config.additionalPlmns ?? []).map((p: { mcc: string; mnc: string }) => deriveImsDomain(p.mcc, p.mnc));
+  const mode: 'sgs' | 'ims' | 'vectorcore' =
+    state.smsDeliveryMode === 'sgs' || state.smsDeliveryMode === 'vectorcore' ? state.smsDeliveryMode : 'ims';
+
+  let ocsPeerInfo: { originHost: string; bindIp: string; port: number } | null = null;
+  if (enabled) {
+    ocsPeerInfo = getOcsPeerInfo();
+    if (!ocsPeerInfo) {
+      throw new Error('SigScale OCS is not configured yet — set it up on the SigScale OCS page first.');
+    }
+    const clientResult = await addOcsDiameterClient(OCS_CLIENT_SOURCE_IP);
+    if (!clientResult.ok) {
+      throw new Error(`Registering S-CSCF as a trusted OCS Diameter client failed: ${clientResult.error}`);
+    }
+  }
+
+  // cdrAccountingEnabled (see setCdrAccountingEnabled() below) is a second,
+  // independent toggle that regenerates this SAME scscf.cfg — must be
+  // preserved here, same reason setSmsDeliveryMode() preserves it above.
+  const cdrAccountingEnabled = state.cdrAccountingEnabled === true;
+
+  fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/scscf.cfg`,
+    scscfIncludeCfg({
+      scscfIp, scscfPort, imsDomain, additionalDomains,
+      blockImsSms: mode === 'sgs',
+      routeSmsToVectorcore: mode === 'vectorcore' ? VECTORCORE_SMSC_SIP_ADDRESS : undefined,
+      voiceCharging: ocsPeerInfo ? { ocsOriginHost: ocsPeerInfo.originHost } : undefined,
+      cdrAccounting: cdrAccountingEnabled,
+    }), 'utf-8');
+  fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/scscf.xml`,
+    scscfDiameterXml({
+      scscfIp, imsDomain,
+      ocsPeer: ocsPeerInfo ? { fqdn: ocsPeerInfo.originHost, port: ocsPeerInfo.port } : undefined,
+    }), 'utf-8');
+  if (ocsPeerInfo) await upsertOcsDnsRecord(state.config.mcc, state.config.mnc, ocsPeerInfo.bindIp);
+  await nsenter('systemctl', ['restart', 'kamailio-scscf']);
+
+  state.voiceChargingEnabled = enabled && !!ocsPeerInfo;
+  fs.writeFileSync(HOST_IMS_STATE, JSON.stringify(state, null, 2), 'utf-8');
+}
+
+// Toggles CDR accounting (Kamailio's own `acc` module, basic flag-based
+// db_flag/db_missed_flag — see scscfIncludeCfg()'s own comment for why NOT
+// acc's newer cdr_enable feature) on the S-CSCF — this is what makes direct
+// 4G/5G IMS-to-IMS calls (no PSTN/2G B2BUA leg) show up in the CDR module's
+// Call History page at all; PSTN Gateway and Asterisk-2G calls are already
+// captured independently via their own Asterisk CSV tailers. Same lightweight
+// shape as setVoiceChargingEnabled() above: regenerates only the S-CSCF
+// include file and restarts that one service. Unlike voice charging, this has
+// no external service dependency to check (no SigScale OCS-style
+// availability guard) — it only touches this deployment's own already-running
+// scscf MySQL database (acc-create.sql sourced unconditionally during IMS
+// Install/Configure, see initializeImsDatabase() above).
+export async function setCdrAccountingEnabled(enabled: boolean): Promise<void> {
+  if (!fs.existsSync(HOST_IMS_STATE)) {
+    throw new Error('IMS is not configured yet — configure IMS first');
+  }
+  const state = JSON.parse(fs.readFileSync(HOST_IMS_STATE, 'utf-8'));
+  const { scscfIp, scscfPort } = state.config;
+  const imsDomain: string = state.imsDomain;
+  const additionalDomains = (state.config.additionalPlmns ?? []).map((p: { mcc: string; mnc: string }) => deriveImsDomain(p.mcc, p.mnc));
+  const mode: 'sgs' | 'ims' | 'vectorcore' =
+    state.smsDeliveryMode === 'sgs' || state.smsDeliveryMode === 'vectorcore' ? state.smsDeliveryMode : 'ims';
+  // voiceChargingEnabled (see setVoiceChargingEnabled() above) is a second,
+  // independent toggle that regenerates this SAME scscf.cfg — must be
+  // preserved here, same reason setSmsDeliveryMode() preserves it.
+  const ocsPeerInfo = state.voiceChargingEnabled === true ? getOcsPeerInfo() : null;
+
+  fs.writeFileSync(`${HOST_KAMAILIO_SCSCF_DIR}/scscf.cfg`,
+    scscfIncludeCfg({
+      scscfIp, scscfPort, imsDomain, additionalDomains,
+      blockImsSms: mode === 'sgs',
+      routeSmsToVectorcore: mode === 'vectorcore' ? VECTORCORE_SMSC_SIP_ADDRESS : undefined,
+      voiceCharging: ocsPeerInfo ? { ocsOriginHost: ocsPeerInfo.originHost } : undefined,
+      cdrAccounting: enabled,
+    }), 'utf-8');
+  await nsenter('systemctl', ['restart', 'kamailio-scscf']);
+
+  state.cdrAccountingEnabled = enabled;
   fs.writeFileSync(HOST_IMS_STATE, JSON.stringify(state, null, 2), 'utf-8');
 }
 
@@ -3090,6 +3376,8 @@ export function createImsRouter(
       let configuredWithVersion: string | undefined;
       let smsDeliveryMode: 'sgs' | 'ims' | 'vectorcore' = 'ims';
       let smsWorkerIntervalSeconds = 30;
+      let voiceChargingEnabled = false;
+      let cdrAccountingEnabled = false;
       if (hasSavedConfig) {
         try {
           const saved = JSON.parse(fs.readFileSync(HOST_IMS_STATE, 'utf-8'));
@@ -3100,8 +3388,14 @@ export function createImsRouter(
           if (typeof saved.smsWorkerIntervalSeconds === 'number' && saved.smsWorkerIntervalSeconds > 0) {
             smsWorkerIntervalSeconds = saved.smsWorkerIntervalSeconds;
           }
+          if (saved.voiceChargingEnabled === true) voiceChargingEnabled = true;
+          if (saved.cdrAccountingEnabled === true) cdrAccountingEnabled = true;
         } catch { /* corrupt */ }
       }
+      // Whether OCS is even available to turn this toggle on — lets the
+      // frontend disable/explain the control instead of letting an operator
+      // hit the hard-fail in setVoiceChargingEnabled() first.
+      const ocsAvailable = !!getOcsPeerInfo();
       // Deployments configured before this field existed have no
       // configuredWithVersion at all — treat that the same as "stale",
       // since we genuinely don't know what template they're running.
@@ -3218,6 +3512,9 @@ export function createImsRouter(
         installStale,
         smsDeliveryMode,
         smsWorkerIntervalSeconds,
+        voiceChargingEnabled,
+        ocsAvailable,
+        cdrAccountingEnabled,
       });
     } catch (err) {
       logger.error({ err: String(err) }, 'ims status error');
@@ -3240,6 +3537,27 @@ export function createImsRouter(
     } catch (err) {
       await auditLogger.log({ action: 'ims_configure', user, details: String(err), success: false });
       logger.error({ err: String(err) }, 'ims sms-delivery-mode error');
+      res.status(500).json({ success: false, error: String(err) });
+    }
+  });
+
+  // POST /api/ims/voice-charging — body: { enabled: boolean }.
+  // Toggle for voice/airtime charging (Diameter Ro) — see
+  // setVoiceChargingEnabled() above. Enabling requires SigScale OCS to
+  // already be configured; disabling always succeeds.
+  router.post('/voice-charging', requireAdmin, async (req: Request, res: Response) => {
+    const user = (req as any).user?.username ?? 'unknown';
+    const { enabled } = req.body as { enabled?: boolean };
+    if (typeof enabled !== 'boolean') {
+      return res.status(400).json({ success: false, error: 'enabled must be a boolean' });
+    }
+    try {
+      await setVoiceChargingEnabled(enabled);
+      await auditLogger.log({ action: 'ims_configure', user, details: `voice_charging_enabled=${enabled}`, success: true });
+      res.json({ success: true, enabled });
+    } catch (err) {
+      await auditLogger.log({ action: 'ims_configure', user, details: String(err), success: false });
+      logger.error({ err: String(err) }, 'ims voice-charging error');
       res.status(500).json({ success: false, error: String(err) });
     }
   });

@@ -321,7 +321,7 @@ export class MmsMsisdnMapRefresher {
   }
 }
 
-interface MmsState {
+export interface MmsState {
   deliveryPath: 'sgs'; // 'ims' reserved for a future delivery path — not implemented yet
   mm1PublicIp: string; // IP real UEs can reach this host on, for the MM1 retrieve URL and MM4 hostname
   esmeName: string;

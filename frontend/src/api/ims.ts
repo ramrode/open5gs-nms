@@ -31,6 +31,9 @@ export interface ImsStatus {
   installStale: boolean;
   smsDeliveryMode: 'sgs' | 'ims' | 'vectorcore';
   smsWorkerIntervalSeconds: number;
+  voiceChargingEnabled: boolean;
+  ocsAvailable: boolean;
+  cdrAccountingEnabled: boolean;
 }
 
 export interface ImsConfigureInput {
@@ -114,6 +117,7 @@ export const imsApi = {
   restart:         async ()                             => { const { data } = await api.post('/restart');           return data; },
   setSmsDeliveryMode: async (mode: 'sgs' | 'ims' | 'vectorcore') => { const { data } = await api.post('/sms-delivery-mode', { mode }); return data; },
   setSmsWorkerInterval: async (seconds: number)         => { const { data } = await api.post('/sms-worker-interval', { seconds }); return data; },
+  setVoiceCharging:     async (enabled: boolean)        => { const { data } = await api.post('/voice-charging', { enabled }); return data; },
   install:         () => fetch('/api/ims/install', {
     method: 'POST', credentials: 'include',
     headers: { 'Content-Type': 'application/json' },

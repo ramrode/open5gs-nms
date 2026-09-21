@@ -3,7 +3,7 @@ import { clsx } from 'clsx';
 import {
   Radio, Settings, Users, Activity, Network,
   ChevronLeft, ChevronRight, Database, ScrollText,
-  Key, UserCog, BarChart2, EyeOff, Shield, ShieldCheck, Clock, GitBranch, Zap, MessageSquare, Phone, PhoneCall, FlaskConical, Wifi, Globe, Radar, TrendingUp, RadioTower, Calculator, Layers, Gauge, ServerCog, Signal,
+  Key, UserCog, BarChart2, EyeOff, Shield, ShieldCheck, Clock, GitBranch, Zap, MessageSquare, Phone, PhoneCall, FlaskConical, Wifi, Globe, Radar, TrendingUp, RadioTower, Calculator, Layers, Gauge, ServerCog, Signal, DollarSign, Wallet, History,
 } from 'lucide-react';
 import { useAuth } from '../../contexts/AuthContext';
 import { NmsLogo, NmsLogoMark } from './NmsLogo';
@@ -43,6 +43,9 @@ const NAV_ITEMS: Array<{ id: string; label: string; icon: React.ComponentType<an
   ...(FEATURES.hnbgw ? [{ id: 'hnbgw', label: '3G UMTS', icon: Signal }] : []),
   ...(FEATURES.ims ? [{ id: 'ims', label: 'IMS / VoLTE', icon: Phone }] : []),
   ...(FEATURES.pstn ? [{ id: 'pstn', label: 'Voice Gateway', icon: PhoneCall }] : []),
+  ...(FEATURES.ocs ? [{ id: 'ocs', label: 'SigScale OCS', icon: DollarSign }] : []),
+  ...(FEATURES.ocs ? [{ id: 'charging-plans', label: 'Charging Plans', icon: Wallet }] : []),
+  ...(FEATURES.cdr ? [{ id: 'cdr', label: 'Call History', icon: History }] : []),
   ...(FEATURES.vowifi ? [{ id: 'vowifi', label: 'VoWiFi', icon: Wifi }] : []),
   ...(FEATURES.secgw ? [{ id: 'secgw', label: 'SecGW', icon: ShieldCheck }] : []),
   ...(FEATURES.twamp ? [{ id: 'twamp', label: 'TWAMP', icon: Gauge }] : []),

@@ -1,6 +1,6 @@
 {
   "name": "open5gs-nms-backend",
-  "version": "2.0.0-beta_0.60",
+  "version": "2.0.0-beta_0.61",
   "description": "Open5GS Network Management System - Backend",
   "license": "AGPL-3.0-only",
   "main": "dist/index.js",
@@ -41,6 +41,7 @@
     "js-yaml": "^4.1.0",
     "lucia": "^3.2.2",
     "mongodb": "^6.3.0",
+    "mysql2": "^3.24.4",
     "oslo": "^1.2.1",
     "pdfkit": "^0.19.1",
     "pino": "^8.17.2",

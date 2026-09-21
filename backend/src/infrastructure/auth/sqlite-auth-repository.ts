@@ -154,6 +154,12 @@ export class SqliteAuthRepository implements IAuthRepository {
         blocked_at INTEGER NOT NULL
       );
 
+      CREATE TABLE IF NOT EXISTS hnb_blocks (
+        ip         TEXT    NOT NULL PRIMARY KEY,
+        blocked_by TEXT    NOT NULL,
+        blocked_at INTEGER NOT NULL
+      );
+
       CREATE TABLE IF NOT EXISTS ue_blocks (
         imsi       TEXT    NOT NULL PRIMARY KEY,
         last_ip    TEXT,

@@ -4,6 +4,111 @@ All notable changes to open5gs-nms are documented here.
 
 ---
 
+## [v2.0-beta_0.61] - 2026-09-21
+
+### Added — IP Plan Tool: bulk re-addressing via explicit Propose → Review → Apply
+
+- One page to re-address a whole deployment instead of visiting every module's own
+  page one at a time. "Propose IP Plan" reads every module's *current* live state
+  fresh (never a cached registry) and suggests non-colliding addresses only for
+  modules still pointing at a gap — anything already real proposes no change and
+  starts unchecked. Review shows current vs. proposed with a per-row checkbox and a
+  restart-cost hint; nothing is written until "Apply Plan."
+- Live-apply, opt-in per row: core-17 (batched into one Auto-Configuration apply),
+  Security Gateway, VoWiFi, 2G GSM, IMS, PSTN's external trunk, MMS. Always
+  plan-only, never live-apply: SEPP's three address fields, the DNS listen address
+  — their live-apply paths are disproportionately large for what this tool does.
+- Full redesign of an earlier version that silently wrote back to a shared registry
+  after any module's own independent Configure — corrected after direct feedback
+  that a planning tool should only ever act on an explicit click, never as a side
+  effect of using some other page. The old bulk-save endpoint and its frontend
+  client method were deleted outright as part of the rewrite, not just stopped
+  being called.
+
+### Added — RAN Kill Switches: Block 2G / 3G / 4G / 5G, plus an expanded "Block all"
+
+- Five Dashboard buttons: an aggregate that now genuinely covers all four RAN
+  generations at once (previously 4G-only despite the name), plus each generation
+  individually. Each button flashes red for as long as anything of that generation
+  is currently blocked, and doubles as the unblock-all action while flashing.
+- 3G had no blocking mechanism at all before this — built a new nftables-based
+  block service from scratch, mirroring the existing 4G/5G pattern.
+- 2G reuses the real per-BTS osmo-bsc administrative lock, not a host-only network
+  rule — genuinely different, higher-impact blast radius than the other three
+  (drops camped UEs immediately), so it's deliberately styled differently in the UI
+  rather than looking identical to the mild ones.
+- The same flash-red "currently blocked" indicator now also applies to every
+  individual per-radio Block/Unblock button on the RAN page itself, not just the
+  Dashboard's aggregate buttons.
+
+### Fixed — the 2G BTS Block/Unblock feature never actually worked, since it was built
+
+- Found live-testing the new RAN Kill Switches feature above — its first-ever real
+  UI trigger. The command it sent was accepted with zero error anywhere (no VTY
+  error, no journalctl error) but silently had no effect: osmo-bsc runs a
+  background reconciliation loop that automatically re-unlocks that exact class of
+  radio object, and the old command had no way to prevent it.
+- Root-caused by reading osmo-bsc's own real source code, not guessed. Fixed with
+  a completely different, correct VTY command that does have the right guard
+  against that reconciliation loop. This also means the restart-recovery path (
+  re-locking a blocked BTS after an osmo-bsc restart) never actually worked either,
+  for as long as the 2G module has existed.
+
+### Fixed — PSTN Gateway: early ringback now covers every GSM-routed call path
+
+- A prior fix added an immediate ringback signal to inbound DID calls routed to a
+  2G subscriber, so a real external caller's own server doesn't give up while
+  real radio paging is still in progress. That fix only covered DID-mapped calls;
+  it's now applied to every other GSM-routed dial path in the PSTN Gateway's
+  dialplan too (auto-dial-by-MSISDN, and Cross-RAN Calling's forwarding entries).
+
+### Added — SigScale OCS: real-time online charging (Diameter Gy + Ro)
+
+- Wires Open5GS SMF's own native Diameter Gy client (present since v2.4.7,
+  previously completely dormant in this deployment) to a newly-installed SigScale
+  OCS for real prepaid credit-control charging on 4G/EPC data sessions.
+  4G/EPC only — Open5GS's SMF has no 5G online-charging client upstream.
+- Voice/airtime charging (Diameter Ro) shares the same listener, completing a
+  dormant block the IMS config template already carried.
+- Getting real charging working end-to-end surfaced and fixed 9 separate real
+  bugs, from Diameter port/bind conflicts to five distinct bugs inside the
+  compiled Kamailio charging module itself — see `docs/features.md` for the
+  full writeup.
+
+### Added — Charging Plans: a simplified data + voice cap GUI over SigScale OCS
+
+- One GUI "Plan" (name, data cap, voice cap) instead of SigScale's own full
+  rating-plan vocabulary, built per direct feedback that the underlying GUI was
+  too complex for day-to-day plan management. Auto-provisions an "Unlimited"
+  plan on every OCS Configure.
+- Fixed a real bug where a subscriber's data and voice usage could silently draw
+  from two disconnected pools instead of one shared one.
+- A still-unresolved bug in OCS's own rating engine can leak stuck charging
+  reservations — mitigated by an automatic background sweep, not yet fixed at
+  the root (upstream source unavailable to patch directly).
+
+### Added — Call History: unified call detail records across PSTN, 2G, and IMS
+
+- Three independently risk-staged phases into one shared collection: PSTN
+  Gateway (stable, verified against a real dataset), Asterisk-2G (code deployed,
+  real end-to-end confirmation still outstanding), and direct 4G/5G IMS-to-IMS
+  calls via Kamailio's own accounting module (confirmed working end-to-end
+  against real test calls, including a call that fell to voicemail and a
+  PSTN-Gateway-routed call correctly split into its real two B2BUA dialogs).
+
+### Added — PSTN Gateway: real external SIP trunk + inbound DID mapping
+
+- A real, off-host-reachable transport (not loopback, unlike every other trunk
+  peer this project had before), a firewall allowlist, and inbound DID→subscriber
+  mapping — all four buildable phases shipped. Real provider connectivity is
+  deliberately not configured yet, since there's nothing to connect to on this
+  deployment.
+- Every subscriber's own real MSISDN is now internally dialable system-wide,
+  auto-routed to IMS or 2G by their own provisioned state, alongside their
+  existing extension short codes, with zero changes to any existing short code.
+
+---
+
 ## [v2.0-beta_0.60] - 2026-09-15
 
 ### Added — Cross-RAN Calling: bridge 4G/5G and 2G short codes across both Asterisk instances

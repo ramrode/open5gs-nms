@@ -11,6 +11,7 @@ import { smsApi, SmsConfigureInput } from '../api/sms';
 import type { SmsStatus, SmsConfigFile } from '../api/sms';
 import { mmsApi } from '../api/mms';
 import type { MmsStatus } from '../api/mms';
+import { ipPlanApi } from '../api/ip-plan';
 import { vectorcoreSmscApi } from '../api/vectorcoreSmsc';
 import type { VectorcoreSmscStatus } from '../api/vectorcoreSmsc';
 import { imsApi } from '../api/ims';
@@ -498,13 +499,6 @@ function OverviewTab({ setPageTab, imsStatus, loadImsStatus, modeActing, interva
 
   return (
     <>
-      <div>
-        <h1 className="text-2xl font-semibold font-display">SMS / MMS</h1>
-        <p className="text-sm text-nms-text-dim mt-1">
-          What software is running this deployment's text and multimedia messaging, and which SMS path is currently active
-        </p>
-      </div>
-
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <SoftwareStatusCard
           icon={MessageSquare} name="SMS via IMS (Kamailio)"
@@ -635,10 +629,10 @@ function SmsImsTab({ imsStatus, activeDeliveryMode }: { imsStatus: ImsStatus | n
     <>
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-semibold font-display flex items-center gap-2">
+          <h2 className="text-lg font-semibold font-display text-nms-text flex items-center gap-2">
             SMS via IMS (Kamailio)
             {isActive && <span className="text-xs px-2 py-1 rounded-full bg-nms-green/10 text-nms-green font-normal">active delivery path</span>}
-          </h1>
+          </h2>
           <p className="text-sm text-nms-text-dim mt-1">SIP MESSAGE handled inline by Kamailio S-CSCF's own SMSC role — part of the IMS module, not a separate install</p>
         </div>
       </div>
@@ -879,10 +873,10 @@ function SmsSgsTab({ activeDeliveryMode }: { activeDeliveryMode?: SmsDeliveryMod
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-semibold font-display flex items-center gap-2">
+          <h2 className="text-lg font-semibold font-display text-nms-text flex items-center gap-2">
             SMS via SGs (Osmocom)
             {isActive && <span className="text-xs px-2 py-1 rounded-full bg-nms-green/10 text-nms-green font-normal">active delivery path</span>}
-          </h1>
+          </h2>
           <p className="text-sm text-nms-text-dim mt-1">UE-to-UE SMS via Osmocom STP + HLR + MSC over the LTE SGs interface</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap shrink-0">
@@ -1253,6 +1247,17 @@ function MmsTab({ onNavigate }: { onNavigate: (t: PageTab) => void }) {
       if (!cfgSeeded.current && s.currentConfig?.mm1PublicIp) {
         setMm1PublicIp(s.currentConfig.mm1PublicIp);
         cfgSeeded.current = true;
+      } else if (!cfgSeeded.current) {
+        // Never configured yet — pre-fill from the Static IP Plan (mms-mm1,
+        // falling back to ims-pcscf per this field's own established
+        // convention of reusing the P-CSCF address) instead of leaving it
+        // blank. Same smart-default pattern as the other wired pages.
+        cfgSeeded.current = true;
+        ipPlanApi.list().then(({ entries }) => {
+          const plan = Object.fromEntries(entries.filter(e => e.planned).map(e => [e.service, e.planned as string]));
+          const ip = plan['mms-mm1'] || plan['ims-pcscf'];
+          if (ip) setMm1PublicIp(ip);
+        }).catch(() => {});
       }
       if (!mobileconfigSeeded.current && s.currentConfig?.mm1PublicIp) {
         setMobileconfigMmscUrl(`http://${s.currentConfig.mm1PublicIp}:8002/mms/retrieve`);
@@ -1371,7 +1376,7 @@ function MmsTab({ onNavigate }: { onNavigate: (t: PageTab) => void }) {
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-semibold font-display">MMS</h1>
+          <h2 className="text-lg font-semibold font-display text-nms-text">MMS</h2>
           <p className="text-sm text-nms-text-dim mt-1">Multimedia Messaging via VectorCore MMSC — delivery notifications ride on the SMS (SGs) SMPP interface</p>
         </div>
         <div className="flex items-center gap-2 flex-wrap shrink-0">
@@ -1737,10 +1742,10 @@ function VectorcoreSmscTab({ activeDeliveryMode }: { activeDeliveryMode?: SmsDel
       {/* Header */}
       <div className="flex items-center justify-between flex-wrap gap-3">
         <div>
-          <h1 className="text-2xl font-semibold font-display flex items-center gap-2">
+          <h2 className="text-lg font-semibold font-display text-nms-text flex items-center gap-2">
             SMS via VectorCore SMSC
             {isActive && <span className="text-xs px-2 py-1 rounded-full bg-nms-green/10 text-nms-green font-normal">active delivery path</span>}
-          </h1>
+          </h2>
           <p className="text-sm text-nms-text-dim mt-1">
             A dedicated SMS center (github.com/vectorcore-mobile/vectorcore-smsc) integrated via SIP/3GPP-ISC — S-CSCF relays MESSAGE to it when selected as the active delivery mode
           </p>
@@ -1938,6 +1943,13 @@ export function SMSPage() {
 
   return (
     <div className="p-6 space-y-6">
+      <div>
+        <h1 className="text-2xl font-semibold font-display">SMS / MMS</h1>
+        <p className="text-sm text-nms-text-dim mt-1">
+          What software is running this deployment's text and multimedia messaging, and which SMS path is currently active
+        </p>
+      </div>
+
       <PageTabBar pageTab={pageTab} setPageTab={setPageTab} activeDeliveryMode={imsStatus?.smsDeliveryMode} />
 
       {pageTab === 'overview' && (

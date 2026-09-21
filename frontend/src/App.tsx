@@ -21,6 +21,9 @@ import { FRRPage } from './pages/FRRPage';
 import { SMSPage } from './pages/SMSPage';
 import { IMSPage } from './pages/IMSPage';
 import { PstnGatewayPage } from './pages/PstnGatewayPage';
+import { OcsPage } from './pages/OcsPage';
+import { ChargingPlansPage } from './pages/ChargingPlansPage';
+import { CallHistoryPage } from './pages/CallHistoryPage';
 import { VoWiFiPage } from './pages/VoWiFiPage';
 import { SecGWPage } from './pages/SecGWPage';
 import { GsmPage } from './pages/GsmPage';
@@ -107,6 +110,12 @@ function App(): JSX.Element {
         return FEATURES.ims ? <IMSPage /> : <DashboardPage />;
       case 'pstn':
         return FEATURES.pstn ? <PstnGatewayPage onNavigate={setActiveTab} /> : <DashboardPage />;
+      case 'ocs':
+        return FEATURES.ocs ? <OcsPage /> : <DashboardPage />;
+      case 'charging-plans':
+        return FEATURES.ocs ? <ChargingPlansPage /> : <DashboardPage />;
+      case 'cdr':
+        return FEATURES.cdr ? <CallHistoryPage /> : <DashboardPage />;
       case 'vowifi':
         return FEATURES.vowifi ? <VoWiFiPage /> : <DashboardPage />;
       case 'secgw':

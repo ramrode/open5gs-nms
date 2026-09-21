@@ -11,6 +11,13 @@ import { clsx } from 'clsx';
 import { FEATURES } from '../../config/features';
 import { gsmApi, type BtsEntry, type GsmSignalSample, type PdpContext } from '../../api/gsm';
 import { hnbgwApi, parseHnbList, type RegisteredHnb } from '../../api/hnbgw';
+import { pstnApi } from '../../api/pstn';
+import { asterisk2gApi } from '../../api/asterisk-2g';
+import { vowifiApi } from '../../api/vowifi';
+import { secgwApi } from '../../api/secgw';
+import { ocsApi } from '../../api/ocs';
+import { smsApi } from '../../api/sms';
+import { mmsApi } from '../../api/mms';
 import { Signal } from 'lucide-react';
 
 interface RANPageProps {
@@ -300,7 +307,7 @@ function RadioBlockButton({ ip, isBlocked, isAdmin, isSyntheticIp, deviceNoun, d
   const cls = 'flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded transition-colors border';
   return isBlocked ? (
     <button onClick={() => onUnblock(ip)} title={`Restore ${blockedInterfaces} to this ${deviceNoun}`}
-      className={clsx(cls, 'text-nms-text-dim hover:text-nms-text border-nms-border hover:border-nms-text-dim')}>
+      className={clsx(cls, 'animate-flash-red text-nms-red border-nms-red/40 hover:text-white hover:bg-nms-red')}>
       <ShieldOff className="w-2.5 h-2.5" />{compact ? 'Unblock' : `Unblock ${deviceNounCap}`}
     </button>
   ) : (
@@ -810,6 +817,29 @@ function buildIPTable(configs: any): IPRow[] {
     metricsServers(scp).forEach(ip => add({ ip, service: 'SCP', interface: 'Metrics (Prometheus)', protocol: 'HTTP', port: '9090', direction: 'server', connects_to: 'Prometheus', description: 'Prometheus scrapes SCP metrics', group: '5G', loopback: lo(ip) }));
   }
 
+  // ── SEPP (N32 roaming) ──
+  const sepp = configs?.sepp1?.sepp;
+  if (sepp) {
+    sbiServers(sepp).forEach(ip => add({ ip, service: 'SEPP', interface: 'SBI server (Nsepp)', protocol: 'HTTP/2', port: '7777', direction: 'server', connects_to: 'Internal NFs', description: 'Internal SBI server used for SEPP\'s own NF registration/discovery', group: '5G', loopback: lo(ip) }));
+    sbiClients(sepp, 'nrf').forEach(ip => add({ ip, service: 'SEPP', interface: 'SBI client → NRF', protocol: 'HTTP/2', port: '7777', direction: 'client', connects_to: 'NRF', description: 'SEPP registers with NRF', group: '5G', loopback: lo(ip) }));
+    (sepp?.n32?.server || []).forEach((s: any) => {
+      if (!s.address) return;
+      add({ ip: s.address, service: 'SEPP', interface: 'N32-c handshake server', protocol: 'HTTPS', port: String(s.port || 7777), direction: 'server', connects_to: 'Roaming partner SEPP', description: 'Partner SEPP dials this to negotiate the N32 security association (TLS or PRINS) before roaming signaling starts', group: '5G', loopback: lo(s.address) });
+      const n32f = s.n32f;
+      if (n32f?.address) {
+        add({ ip: n32f.address, service: 'SEPP', interface: 'N32-f message forwarding', protocol: 'HTTPS', port: String(n32f.port || 7777), direction: 'server', connects_to: 'Roaming partner SEPP', description: 'Actual inter-PLMN SBI message forwarding once the N32-c handshake completes — roaming AMF/UDM/etc. traffic rides this connection', group: '5G', loopback: lo(n32f.address) });
+      }
+    });
+    (sepp?.n32?.client?.sepp || []).forEach((c: any) => {
+      if (!c.uri) return;
+      let host = '';
+      try { host = new URL(c.uri).hostname; } catch { host = c.uri; }
+      if (!host) return;
+      add({ ip: host, service: 'SEPP', interface: 'N32-c client', protocol: 'HTTPS', port: '7777', direction: 'client', connects_to: c.receiver || 'Roaming partner SEPP', description: `This SEPP dials the roaming partner (${c.receiver || 'peer'}) to establish the N32 security association`, group: '5G', loopback: lo(host) });
+    });
+    metricsServers(sepp).forEach(ip => add({ ip, service: 'SEPP', interface: 'Metrics (Prometheus)', protocol: 'HTTP', port: '9090', direction: 'server', connects_to: 'Prometheus', description: 'Prometheus scrapes SEPP metrics', group: '5G', loopback: lo(ip) }));
+  }
+
   // ── IMS (VoLTE) ──────────────────────────────────────────────────────────────
   const ims = configs?._ims as { pcscfIp?: string; pcscfPort?: number; icscfIp?: string; icscfPort?: number; scscfIp?: string; scscfPort?: number; rtpEngineIp?: string; dnsIp?: string } | null | undefined;
   if (ims?.pcscfIp) {
@@ -839,6 +869,85 @@ function buildIPTable(configs: any): IPRow[] {
     if (ims.dnsIp) {
       add({ ip: ims.dnsIp, service: 'BIND9 (IMS DNS)', interface: 'DNS', protocol: 'UDP', port: '53', direction: 'server', connects_to: 'UE / Kamailio', description: 'IMS DNS — provides SRV and NAPTR records for IMS realm routing (pcscf, icscf, scscf FQDNs)', group: 'IMS', loopback: lo(ims.dnsIp) });
     }
+  }
+
+  // ── SMS (SGs) — osmo-hlr / osmo-msc, shared with the 2G/3G modules ──────────
+  const sms = configs?._sms as { installed?: boolean; currentConfig?: { mscBindIp?: string; hlrBindIp?: string; mmeLocalIp?: string } } | null | undefined;
+  if (sms?.installed && sms.currentConfig) {
+    const { mscBindIp, hlrBindIp } = sms.currentConfig;
+    if (hlrBindIp) add({ ip: hlrBindIp, service: 'osmo-hlr', interface: 'GSUP', protocol: 'TCP', port: '4222', direction: 'server', connects_to: 'osmo-msc, osmo-sgsn', description: 'Subscriber database shared by SMS-over-SGs, 2G CS/GPRS, and 3G — MSC and SGSN both query this over GSUP for auth vectors and subscriber profile', group: 'Shared', loopback: lo(hlrBindIp) });
+    if (mscBindIp) add({ ip: mscBindIp, service: 'osmo-msc', interface: 'SGs-AP (via osmo-stp)', protocol: 'SCTP', port: '29118', direction: 'server', connects_to: 'MME', description: 'MME\'s SGs-AP peer — carries SMS-over-SGs and CSFB signaling between the 4G core and the 2G/3G MSC', group: '4G', loopback: lo(mscBindIp) });
+  }
+
+  // ── MMS (VectorCore MMSC) ────────────────────────────────────────────────────
+  const mms = configs?._mms as { installed?: boolean; currentConfig?: { mm1PublicIp?: string } } | null | undefined;
+  if (mms?.installed && mms.currentConfig?.mm1PublicIp) {
+    add({ ip: mms.currentConfig.mm1PublicIp, service: 'VectorCore MMSC', interface: 'MM1 (via MSISDN proxy)', protocol: 'HTTP', port: '8002', direction: 'server', connects_to: 'UE (over GGSN/PGW data)', description: 'UEs POST MM1 PDUs here over their data APN — a small Go reverse proxy in front resolves sender MSISDN from the UE\'s Framed-Routing IP and injects it as X-MSISDN before forwarding to VectorCore', group: 'Shared', loopback: lo(mms.currentConfig.mm1PublicIp) });
+  }
+
+  // ── Voice Gateway (Asterisk / PSTN + real external SIP trunk) ───────────────
+  const pstn = configs?._pstn as { installed?: boolean; currentConfig?: { asteriskIp?: string; externalTrunk?: { enabled?: boolean; bindIp?: string; bindPort?: number; providerHost?: string; providerPort?: number; providerCidr?: string } } } | null | undefined;
+  if (pstn?.installed && pstn.currentConfig?.asteriskIp) {
+    const asteriskIp = pstn.currentConfig.asteriskIp;
+    add({ ip: asteriskIp, service: 'Voice Gateway (Asterisk)', interface: 'SIP internal trunk', protocol: 'UDP', port: '5060', direction: 'server', connects_to: 'S-CSCF, Asterisk-2G', description: 'S-CSCF\'s dispatcher forwards unregistered-number INVITEs here (via I-CSCF) for short-code/MSISDN calls; Asterisk-2G reaches this same trunk for Cross-RAN Calling', group: 'IMS', loopback: lo(asteriskIp) });
+    const ext = pstn.currentConfig.externalTrunk;
+    if (ext?.enabled && ext.bindIp) {
+      add({ ip: ext.bindIp, service: 'Voice Gateway (Asterisk)', interface: 'SIP external trunk (real DID)', protocol: 'UDP', port: String(ext.bindPort || 5060), direction: 'server', connects_to: ext.providerHost || 'SIP provider', description: `Real external SIP trunk — carries real inbound DID calls (mapped to any subscriber, any RAN tech) and real outbound calls (subscriber's own MSISDN as caller ID); firewall-restricted to ${ext.providerCidr || 'the configured provider CIDR'} only`, group: 'IMS', loopback: lo(ext.bindIp) });
+      if (ext.providerHost) {
+        add({ ip: ext.providerHost, service: 'Voice Gateway (Asterisk)', interface: 'SIP client → external trunk', protocol: 'UDP', port: String(ext.providerPort || 5060), direction: 'client', connects_to: 'External SIP provider', description: 'Asterisk dials the provider\'s SIP endpoint for outbound calls to any number that isn\'t a known subscriber MSISDN or internal short code', group: 'IMS', loopback: lo(ext.providerHost) });
+      }
+    }
+  }
+
+  // ── Asterisk-2G (2G voice B2BUA, Cross-RAN Calling peer) ────────────────────
+  const ast2g = configs?._asterisk2g as { installed?: boolean; bindIp?: string; bindPort?: number; sipConnPeer?: { ip: string; port: number } | null } | null | undefined;
+  if (ast2g?.installed && ast2g.bindIp) {
+    add({ ip: ast2g.bindIp, service: 'Asterisk-2G', interface: 'SIP (2G voice B2BUA)', protocol: 'UDP', port: String(ast2g.bindPort || 5060), direction: 'server', connects_to: 'osmo-sip-connector, Voice Gateway', description: 'Isolated Asterisk instance that loops a 2G call back through osmo-sip-connector so both legs get real TCH-assigned audio (osmo-msc\'s own built-in handler completes signaling but never bridges RTP); also the Cross-RAN Calling peer for the Voice Gateway trunk', group: 'Shared', loopback: lo(ast2g.bindIp) });
+    if (ast2g.sipConnPeer?.ip) {
+      add({ ip: ast2g.sipConnPeer.ip, service: 'Asterisk-2G', interface: 'SIP client → osmo-sip-connector', protocol: 'UDP', port: String(ast2g.sipConnPeer.port || 5060), direction: 'client', connects_to: 'osmo-sip-connector', description: 'Asterisk-2G dials osmo-sip-connector to page the second 2G phone via MNCC External mode', group: 'Shared', loopback: lo(ast2g.sipConnPeer.ip) });
+    }
+  }
+
+  // ── 2G GSM (Osmocom: osmo-bsc/bts/pcu/sgsn/ggsn) ────────────────────────────
+  const gsm = configs?._gsm as { installedOnDisk?: boolean; configured?: boolean; gprsEnabled?: boolean; bscMgwBindIp?: string; mscMgwBindIp?: string; mgwRtpBindIp?: string; sgsnGtpLocalIp?: string; ggsnGtpBindIp?: string; sip?: { configured?: boolean; localIp?: string; localPort?: number; remoteHost?: string; remotePort?: number } } | null | undefined;
+  if (gsm?.installedOnDisk && gsm.configured) {
+    if (gsm.bscMgwBindIp) add({ ip: gsm.bscMgwBindIp, service: 'GSM/2G (osmo-bsc MGW)', interface: 'MGCP (BSC media gateway)', protocol: 'UDP', port: '2427', direction: 'server', connects_to: 'osmo-bsc', description: 'Dedicated OsmoMGW instance switching TCH audio for 2G calls at the BSC side', group: 'Shared', loopback: lo(gsm.bscMgwBindIp) });
+    if (gsm.mscMgwBindIp) add({ ip: gsm.mscMgwBindIp, service: 'GSM/2G (osmo-msc MGW)', interface: 'MGCP (MSC media gateway)', protocol: 'UDP', port: '2427', direction: 'server', connects_to: 'osmo-msc', description: 'Dedicated OsmoMGW instance switching TCH audio for 2G calls at the MSC side', group: 'Shared', loopback: lo(gsm.mscMgwBindIp) });
+    if (gsm.mgwRtpBindIp) add({ ip: gsm.mgwRtpBindIp, service: 'GSM/2G (osmo-*-mgw)', interface: 'RTP media', protocol: 'UDP', port: '16384-16388', direction: 'server', connects_to: 'BTS / Asterisk-2G', description: 'RTP bearer address advertised by the 2G media gateways for real call audio', group: 'Shared', loopback: lo(gsm.mgwRtpBindIp) });
+    if (gsm.gprsEnabled && gsm.sgsnGtpLocalIp) add({ ip: gsm.sgsnGtpLocalIp, service: 'osmo-sgsn', interface: 'Gn GTP (to GGSN)', protocol: 'UDP', port: '2123/2152', direction: 'client', connects_to: 'osmo-ggsn', description: '2G packet-switched (GPRS/EDGE) core — SGSN\'s own GTP address toward the GGSN', group: 'Shared', loopback: lo(gsm.sgsnGtpLocalIp) });
+    if (gsm.gprsEnabled && gsm.ggsnGtpBindIp) add({ ip: gsm.ggsnGtpBindIp, service: 'osmo-ggsn', interface: 'Gn GTP-U', protocol: 'UDP', port: '2152', direction: 'server', connects_to: 'osmo-sgsn', description: '2G packet data gateway — terminates GPRS/EDGE PDP contexts and NATs UE data to the internet-facing interface', group: 'Shared', loopback: lo(gsm.ggsnGtpBindIp) });
+    if (gsm.sip?.configured && gsm.sip.localIp) {
+      add({ ip: gsm.sip.localIp, service: 'osmo-sip-connector', interface: 'SIP (MNCC External)', protocol: 'UDP', port: String(gsm.sip.localPort || 5060), direction: 'server', connects_to: 'osmo-msc, operator-chosen remote', description: 'Bridges osmo-msc\'s MNCC socket to real SIP once MNCC mode is set to External — required for any 2G call to carry real audio', group: 'Shared', loopback: lo(gsm.sip.localIp) });
+      if (gsm.sip.remoteHost) add({ ip: gsm.sip.remoteHost, service: 'osmo-sip-connector', interface: 'SIP client → remote', protocol: 'UDP', port: String(gsm.sip.remotePort || 5060), direction: 'client', connects_to: 'Asterisk-2G (or operator-chosen SIP peer)', description: 'osmo-sip-connector dials this remote SIP peer to complete the second leg of a 2G call', group: 'Shared', loopback: lo(gsm.sip.remoteHost) });
+    }
+  }
+
+  // ── 3G UMTS (OsmoHNBGW) ──────────────────────────────────────────────────────
+  const hnbgw = configs?._hnbgw as { installedOnDisk?: boolean; configured?: boolean; iuhLocalIp?: string; iuhLocalPort?: number; mgwBindIp?: string; mgwRtpBindIp?: string } | null | undefined;
+  if (hnbgw?.installedOnDisk && hnbgw.configured && hnbgw.iuhLocalIp) {
+    add({ ip: hnbgw.iuhLocalIp, service: 'OsmoHNBGW', interface: 'Iuh (SCTP, HNBAP/RUA)', protocol: 'SCTP', port: String(hnbgw.iuhLocalPort || 29169), direction: 'server', connects_to: '3G femtocell (HNB)', description: 'A real or virtual Home NodeB (3G femtocell) dials this to register and carry IuCS/IuPS signaling, bridged onward to osmo-msc and osmo-sgsn over the existing osmo-stp', group: 'Shared', loopback: lo(hnbgw.iuhLocalIp) });
+    if (hnbgw.mgwBindIp) add({ ip: hnbgw.mgwBindIp, service: 'OsmoHNBGW (dedicated MGW)', interface: 'MGCP', protocol: 'UDP', port: '2427', direction: 'server', connects_to: 'OsmoHNBGW', description: 'Third, dedicated OsmoMGW instance switching 3G call audio — own loopback, independent of the 2G module\'s MGW instances', group: 'Shared', loopback: lo(hnbgw.mgwBindIp) });
+    if (hnbgw.mgwRtpBindIp) add({ ip: hnbgw.mgwRtpBindIp, service: 'OsmoHNBGW (dedicated MGW)', interface: 'RTP media', protocol: 'UDP', port: '16384-16388', direction: 'server', connects_to: 'HNB', description: 'RTP bearer address for 3G call audio', group: 'Shared', loopback: lo(hnbgw.mgwRtpBindIp) });
+  }
+
+  // ── VoWiFi (ePDG) ─────────────────────────────────────────────────────────────
+  const vowifi = configs?._vowifi as { installedOnDisk?: boolean; configured?: boolean; epdgIp?: string | null; aaaListenIp?: string | null; aaaFqdn?: string | null } | null | undefined;
+  if (vowifi?.installedOnDisk && vowifi.configured) {
+    if (vowifi.epdgIp) add({ ip: vowifi.epdgIp, service: 'ePDG (VoWiFi)', interface: 'IKEv2/IPsec', protocol: 'UDP', port: '500/4500', direction: 'server', connects_to: 'UE (over Wi-Fi)', description: 'UEs on Wi-Fi dial this to establish an IPsec tunnel into the EPC — the VoWiFi equivalent of an eNodeB\'s S1 termination', group: 'IMS', loopback: lo(vowifi.epdgIp) });
+    if (vowifi.aaaListenIp) add({ ip: vowifi.aaaListenIp, service: 'VoWiFi AAA', interface: 'Diameter S6b/SWm', protocol: 'SCTP', port: '3868', direction: 'server', connects_to: 'ePDG, SMF', description: `VoWiFi AAA server${vowifi.aaaFqdn ? ` (${vowifi.aaaFqdn})` : ''} — authenticates the UE's Wi-Fi attach and authorizes the PDN connection via SMF's S6b peer`, group: 'IMS', loopback: lo(vowifi.aaaListenIp) });
+  }
+
+  // ── Security Gateway (SecGW) ─────────────────────────────────────────────────
+  const secgw = configs?._secgw as { installedOnDisk?: boolean; configured?: boolean; gatewayIp?: string | null; gatewayFqdn?: string | null; poolCidr?: string | null; activeTunnelCount?: number } | null | undefined;
+  if (secgw?.installedOnDisk && secgw.configured && secgw.gatewayIp) {
+    add({ ip: secgw.gatewayIp, service: 'SecGW', interface: 'IKEv2/IPsec', protocol: 'UDP', port: '500/4500', direction: 'server', connects_to: 'Radios (eNB/gNB)', description: `Radios establish an IPsec ESP tunnel here before their S1AP/NGAP/GTP traffic reaches the core${secgw.gatewayFqdn ? ` — advertised as ${secgw.gatewayFqdn}` : ''}${secgw.poolCidr ? `; per-radio tunnel addresses assigned from ${secgw.poolCidr}` : ''}${typeof secgw.activeTunnelCount === 'number' ? ` (${secgw.activeTunnelCount} active tunnel${secgw.activeTunnelCount === 1 ? '' : 's'})` : ''}`, group: 'Shared', loopback: lo(secgw.gatewayIp) });
+  }
+
+  // ── SigScale OCS (Diameter Gy/Ro charging) ───────────────────────────────────
+  const ocs = configs?._ocs as { installed?: boolean; currentConfig?: { bindIp?: string; httpPort?: number; originHost?: string } } | null | undefined;
+  if (ocs?.installed && ocs.currentConfig?.bindIp) {
+    add({ ip: ocs.currentConfig.bindIp, service: 'SigScale OCS', interface: 'Diameter Gy/Ro', protocol: 'SCTP/TCP', port: '3868', direction: 'server', connects_to: 'SMF (Gy), S-CSCF (Ro)', description: `Real-time prepaid credit-control — SMF's native Gy client charges data sessions, S-CSCF's ims_charging module charges voice minutes, both over this one Diameter Application-Id 4 listener${ocs.currentConfig.originHost ? ` (Origin-Host ${ocs.currentConfig.originHost})` : ''}`, group: 'Shared', loopback: lo(ocs.currentConfig.bindIp) });
+    if (ocs.currentConfig.httpPort) add({ ip: ocs.currentConfig.bindIp, service: 'SigScale OCS', interface: 'HTTP (Polymer GUI/REST)', protocol: 'HTTP', port: String(ocs.currentConfig.httpPort), direction: 'server', connects_to: 'Operator browser', description: 'OCS\'s own web GUI and REST API — rating plans, balances, and subscriber products are managed directly here, not reimplemented in this NMS', group: 'Shared', loopback: lo(ocs.currentConfig.bindIp) });
   }
 
   // deduplicate
@@ -1522,7 +1631,7 @@ function Gsm2GBlockButton({ bts, isAdmin, onRequestBlock, onUnblock }: {
   const cls = 'flex items-center gap-1 text-[10px] font-semibold px-1.5 py-0.5 rounded transition-colors border flex-shrink-0';
   return blocked ? (
     <button onClick={(e) => { e.stopPropagation(); onUnblock(bts.id); }} title="Unlock this BTS at osmo-bsc — resumes broadcasting and accepting UEs"
-      className={clsx(cls, 'text-nms-text-dim hover:text-nms-text border-nms-border hover:border-nms-text-dim')}>
+      className={clsx(cls, 'animate-flash-red text-nms-red border-nms-red/40 hover:text-white hover:bg-nms-red')}>
       <Unlock className="w-2.5 h-2.5" />Unblock
     </button>
   ) : (
@@ -1834,11 +1943,32 @@ export const RANPage: React.FC<RANPageProps> = ({ onNavigateToSubscriber }) => {
   const [allConfigs, setAllConfigs]   = useState<any>(null);
   const loadConfigs = useCallback(async () => {
     try {
-      const [configs, imsStatus] = await Promise.all([
+      const [configs, imsStatus, pstnStatus, asterisk2gStatus, gsmStatus, hnbgwStatus, vowifiStatus, secgwStatus, ocsStatus, smsStatus, mmsStatus] = await Promise.all([
         configApi.getAll(),
         imsApi.getStatus().catch(() => null),
+        pstnApi.getStatus().catch(() => null),
+        asterisk2gApi.getStatus().catch(() => null),
+        gsmApi.getStatus().catch(() => null),
+        hnbgwApi.getStatus().catch(() => null),
+        vowifiApi.getStatus().catch(() => null),
+        secgwApi.getStatus().catch(() => null),
+        ocsApi.getStatus().catch(() => null),
+        smsApi.getStatus().catch(() => null),
+        mmsApi.getStatus().catch(() => null),
       ]);
-      setAllConfigs({ ...configs, _ims: imsStatus?.currentConfig ?? null });
+      setAllConfigs({
+        ...configs,
+        _ims: imsStatus?.currentConfig ?? null,
+        _pstn: pstnStatus ?? null,
+        _asterisk2g: asterisk2gStatus ?? null,
+        _gsm: gsmStatus ?? null,
+        _hnbgw: hnbgwStatus ?? null,
+        _vowifi: vowifiStatus ?? null,
+        _secgw: secgwStatus ?? null,
+        _ocs: ocsStatus ?? null,
+        _sms: smsStatus ?? null,
+        _mms: mmsStatus ?? null,
+      });
     } catch { /* silent */ }
   }, []);
 

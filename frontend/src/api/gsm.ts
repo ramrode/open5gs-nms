@@ -248,6 +248,14 @@ export const gsmApi = {
     const { data } = await api.post(`/bts/${id}/unblock`);
     return data;
   },
+  // Bulk-lock every configured BTS at once — the Dashboard's "Block 2G"
+  // kill switch. Reuses the same real osmo-bsc admin-lock as blockBts above
+  // (not an nftables block like radioBlockApi/gnbBlockApi/hnbBlockApi), so
+  // every camped UE across every BTS drops immediately.
+  blockAllBts: async (): Promise<{ success: boolean; results: { id: string; name: string; success: boolean; error?: string }[] }> => {
+    const { data } = await api.post('/bts/block-all');
+    return data;
+  },
   getConfigs: async (): Promise<{ success: boolean; files: GsmConfigFile[] }> => {
     const { data } = await api.get('/configs');
     return data;

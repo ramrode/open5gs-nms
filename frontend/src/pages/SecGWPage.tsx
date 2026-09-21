@@ -23,6 +23,7 @@ import type {
 import { genieacsApi } from '../api/genieacs';
 import type { BaicellsRadio, SercommRadio } from '../api/genieacs';
 import { useCopyToClipboard } from '../hooks/useCopyToClipboard';
+import { ipPlanApi } from '../api/ip-plan';
 
 function optionLabel<T extends string>(options: { label: string; value: T }[], value: T): string {
   return options.find(o => o.value === value)?.label ?? value;
@@ -302,6 +303,15 @@ function SetupTab({ status, refresh }: { status: SecGwStatus | null; refresh: ()
     if (status?.interfaceMode) setInterfaceMode(status.interfaceMode);
     if (status?.poolCidr) setPoolCidr(status.poolCidr);
   }, [status?.gatewayIp, status?.interfaceMode, status?.poolCidr]);
+
+  // Pre-fill from the Auto-Config page's Static IP Plan when this module has
+  // never been configured here yet — a smart default, not a lock; the
+  // operator can still edit it below like always. Deliberately does NOT run
+  // once status.gatewayIp is set (the effect above already owns that case).
+  useEffect(() => {
+    if (status?.gatewayIp) return;
+    ipPlanApi.get('secgw-gateway').then(ip => { if (ip) setGatewayIp(ip); }).catch(() => {});
+  }, [status?.gatewayIp]);
 
   const isInstalling = status?.installStatus === 'installing';
   // First-run vs. update-available vs. already-installed — the "1. Install" card only
