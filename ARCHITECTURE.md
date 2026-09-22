@@ -35,7 +35,7 @@ The Open5GS NMS follows a **three-tier architecture** with clear separation betw
 │  APPLICATION LAYER                                           │
 │  nginx Reverse Proxy (Alpine Linux)                         │
 │  - Routes /api/* → backend:3001                             │
-│  - Upgrades WebSocket → backend:3002                        │
+│  - Upgrades WebSocket → backend:3001 (same port, in-process) │
 │  - Serves static frontend from /usr/share/nginx/html        │
 └───────────────┬──────────────────┬──────────────────────────┘
                 │                  │
@@ -44,7 +44,7 @@ The Open5GS NMS follows a **three-tier architecture** with clear separation betw
 │  BUSINESS LOGIC LAYER                                        │
 │  Backend (Node.js 20 + TypeScript + Express)                │
 │  Clean Architecture: Domain → Application → Infrastructure   │
-│  Ports: 3001 (REST), 3002 (WebSocket)                       │
+│  Port: 3001 (REST + WebSocket upgrade, same listener)       │
 │  Container: privileged=true, network_mode=host, pid=host    │
 └─────┬──────────┬──────────┬──────────────────────────────┬─┘
       │          │          │                              │
@@ -414,6 +414,11 @@ switch (activeTab) {
   case 'vowifi':       return <VoWiFiPage />;         // optional module
   case 'validation':   return <ValidationPage />;     // optional module
   case 'users':        return <UserManagementPage />;
+  // ...and ~16 more optional/add-on module cases (apn-profiles, radio-config,
+  // rf-planning, traffic-history, radio-signal, snmp, pstn, ocs,
+  // charging-plans, cdr, secgw, gsm, gsm-signal, hnbgw, twamp, pcap, ...) —
+  // this list is illustrative, not exhaustive; see App.tsx for the current
+  // full switch.
 }
 ```
 
@@ -705,6 +710,12 @@ Persisted via Docker volume mount `./data:/app/data`.
 - Timing-safe login (prevents user enumeration)
 - Rate limiting on login endpoint (10 attempts/15min per IP)
 
+**Authorization:**
+- Real multi-user support with two roles, `admin` and `viewer` (`sqlite-auth-repository.ts`)
+- Full user management UI (`UserManagementPage.tsx`) — create/edit/delete users, toggle role
+- Backend-enforced on every route via `requireAdmin`/`requireRole` middleware, not just UI-hidden
+- Safety guard prevents removing the last remaining admin account
+
 **Input Validation:**
 - Zod schema validation on all API inputs
 - Type checking with TypeScript
@@ -728,10 +739,6 @@ Persisted via Docker volume mount `./data:/app/data`.
 - Auth data isolated from Open5GS data
 
 ### Security Limitations
-
-**Single user only:**
-- No multi-user management UI in v1.2
-- No role-based access control (RBAC) — role field exists for future use
 
 **No Encryption in Transit by Default:**
 - HTTP only out of the box
@@ -764,11 +771,11 @@ See **[docs/deployment.md](docs/deployment.md)** for:
 │  │  network_mode: host                                 │ │
 │  │  Port: 8888                                         │ │
 │  └─────────────┬──────────────────────────────────────┘ │
-│                │ proxies to localhost:3001/3002         │
+│                │ proxies to localhost:3001               │
 │  ┌─────────────▼──────────────────────────────────────┐ │
 │  │  Backend Container (Node.js 20)                     │ │
 │  │  network_mode: host, privileged: true, pid: host   │ │
-│  │  Ports: 3001 (REST), 3002 (WebSocket)              │ │
+│  │  Port: 3001 (REST + WebSocket, same listener)      │ │
 │  │  Volumes:                                            │ │
 │  │    - /etc/open5gs → /etc/open5gs                   │ │
 │  │    - /var/log/open5gs → /var/log/open5gs (ro)     │ │
@@ -803,8 +810,7 @@ See **[docs/deployment.md](docs/deployment.md)** for:
 
 **Port Allocation:**
 - 8888 - nginx (frontend + API proxy)
-- 3001 - Backend REST API (internal)
-- 3002 - Backend WebSocket (internal)
+- 3001 - Backend REST API + WebSocket upgrade, same listener (internal)
 - 9099 - Prometheus (configurable via `PROMETHEUS_PORT`)
 - 3000 - Grafana (configurable via `GRAFANA_PORT`)
 - 27017 - MongoDB (localhost only)

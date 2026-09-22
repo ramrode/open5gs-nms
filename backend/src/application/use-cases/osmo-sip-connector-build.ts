@@ -40,21 +40,92 @@ export const MNCC_SOCKET_PATH = '/tmp/osmo-msc-mncc.sock';
 export const SIPCONN_TAG = '1.6.1';
 
 // Bump whenever the build steps below change in a way that needs a rebuild.
-export const BUILD_REV = 1;
+export const BUILD_REV = 2;
 
 export const BUILD_STEPS = [
-  'preparing', 'installing_apt_deps', 'cloning', 'building', 'verifying', 'deploying',
+  'preparing', 'installing_apt_deps', 'cloning', 'patching', 'building', 'verifying', 'deploying',
 ] as const;
 export type SipConnBuildStep = typeof BUILD_STEPS[number];
 
-// Clean upstream build — deliberately NO custom source patches. An earlier
-// version of this module carried hand-written C patches to sdp.c (payload-
-// type echo + AMR octet-align) chasing 2G<->IMS voice-interop audio bugs;
-// both were reverted (regressions, never confirmed fixed) along with the
-// whole voice-interop routing direction on 2026-09-12. This build exists
-// purely to run the daemon exactly as Osmocom ships it — wiring it into any
-// specific call-routing scheme is left to whoever configures the "remote"
-// SIP target (see osmoSipConnectorCfg() below), not baked in here.
+// Otherwise a clean upstream build — an earlier version of this module
+// carried hand-written C patches to sdp.c (payload-type echo + AMR
+// octet-align) chasing 2G<->IMS voice-interop audio bugs; both were reverted
+// (regressions, never confirmed fixed) along with the whole voice-interop
+// routing direction on 2026-09-12. Wiring this daemon into any specific
+// call-routing scheme is still left to whoever configures the "remote" SIP
+// target (see osmoSipConnectorCfg() below), not baked in here.
+//
+// The ONE patch this build DOES carry (BUILD_REV 2, added 2026-09-21) is
+// unrelated to routing/audio-codec content — it's a real, confirmed-live
+// signaling-timeout bug: mncc.c's start_cmd_timer() hardcodes a 5s window
+// for every "wait for the next expected MNCC message" case it's used for,
+// including MNCC_SETUP_COMPL_IND — the *originating* leg's own confirmation
+// that its UE received CONNECT and sent back CONNECT ACKNOWLEDGE, after the
+// callee has already answered. That's a real over-the-air round trip
+// (UE<->BTS<->BSC<->MSC), and 5s isn't consistently enough for it under
+// normal GSM scheduling/retransmission timing — confirmed live 2026-09-21
+// via a full capture session: the exact same caller/callee pair on a native
+// 2G-to-2G short-code call succeeded on one attempt and failed the next,
+// every failure showing this exact timer expiring
+// (`command(0x106) never arrived for leg(...)`) moments after both legs had
+// already been marked connected, tearing down a call that was otherwise
+// completely healthy. SIPCONN_SETUP_COMPL_TIMEOUT_PATCH below widens ONLY
+// that one call site to 15s via a new start_cmd_timer_t() helper — every
+// other start_cmd_timer() caller (RTP_CREATE, REL_CNF, REL_IND) keeps the
+// original 5s, deliberately not touched since they weren't implicated.
+const SIPCONN_SETUP_COMPL_TIMEOUT_PATCH = `import re, sys
+path = 'src/mncc.c'
+src = open(path).read()
+
+old_fn = '''static void start_cmd_timer(struct mncc_call_leg *leg, uint32_t expected_next)
+{
+	leg->rsp_wanted = expected_next;
+
+	leg->cmd_timeout.cb = cmd_timeout;
+	leg->cmd_timeout.data = leg;
+	LOGP(DMNCC, LOGL_DEBUG, "Starting Timer for %s\\\\n", osmo_mncc_name(expected_next));
+	osmo_timer_schedule(&leg->cmd_timeout, 5, 0);
+}'''
+new_fn = '''static void start_cmd_timer_t(struct mncc_call_leg *leg, uint32_t expected_next, int timeout_secs)
+{
+	leg->rsp_wanted = expected_next;
+
+	leg->cmd_timeout.cb = cmd_timeout;
+	leg->cmd_timeout.data = leg;
+	LOGP(DMNCC, LOGL_DEBUG, "Starting Timer for %s (%ds)\\\\n", osmo_mncc_name(expected_next), timeout_secs);
+	osmo_timer_schedule(&leg->cmd_timeout, timeout_secs, 0);
+}
+
+static void start_cmd_timer(struct mncc_call_leg *leg, uint32_t expected_next)
+{
+	start_cmd_timer_t(leg, expected_next, 5);
+}'''
+if old_fn not in src:
+    print('PATCH FAILED: start_cmd_timer() body not found verbatim -- upstream source shape changed', file=sys.stderr)
+    sys.exit(1)
+src = src.replace(old_fn, new_fn, 1)
+
+old_call = '''	start_cmd_timer(leg, MNCC_SETUP_COMPL_IND);
+	mncc_send(leg->conn, MNCC_SETUP_RSP, leg->callref);'''
+new_call = '''	/* Real over-the-air CONNECT -> CONNECT ACKNOWLEDGE round trip
+	 * (UE<->BTS<->BSC<->MSC) routinely needs more than the default 5s under
+	 * normal GSM scheduling/retransmission timing. Confirmed live 2026-09-21:
+	 * intermittent call failures here, the exact same caller/callee pair
+	 * sometimes succeeding and sometimes not, every failure showing this
+	 * timer expiring on the originating leg moments after the callee had
+	 * already answered (both legs briefly marked connected, then torn down
+	 * from underneath). Widened to 15s; other start_cmd_timer() call sites
+	 * (RTP_CREATE, REL_CNF, REL_IND) are untouched at the original 5s. */
+	start_cmd_timer_t(leg, MNCC_SETUP_COMPL_IND, 15);
+	mncc_send(leg->conn, MNCC_SETUP_RSP, leg->callref);'''
+if old_call not in src:
+    print('PATCH FAILED: MNCC_SETUP_COMPL_IND call site not found verbatim -- upstream source shape changed', file=sys.stderr)
+    sys.exit(1)
+src = src.replace(old_call, new_call, 1)
+
+open(path, 'w').write(src)
+print('mncc.c: MNCC_SETUP_COMPL_IND timer widened 5s -> 15s')
+`;
 export function buildOsmoSipConnectorScript(force = false): string {
   return `#!/bin/bash
 set -e
@@ -110,6 +181,13 @@ cd osmo-sip-connector
 git checkout ${SIPCONN_TAG}
 stop_heartbeat
 echo "checked out: $(git describe --tags 2>/dev/null || echo ${SIPCONN_TAG})"
+
+echo "==STEP:patching=="
+cat > /tmp/sipconn-timeout-patch.py << 'PYEOF'
+${SIPCONN_SETUP_COMPL_TIMEOUT_PATCH}
+PYEOF
+python3 /tmp/sipconn-timeout-patch.py
+rm -f /tmp/sipconn-timeout-patch.py
 
 echo "==STEP:building=="
 start_heartbeat

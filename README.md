@@ -308,7 +308,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 ### Real-Time Logging
 - **Four log sources** — Open5GS systemd services, Docker containers, GenieACS access logs, and FRR, all streamed live via WebSocket
 - **Live Log Streaming** — Tail logs from any service, with multi-select service/container filtering
-- **Major Events view** — a filtered timeline of just the meaningful transitions (radio connect/disconnect, 4G attach/detach, 5G register/deregister, PDU session up/down) instead of raw DEBUG noise, across all 16 NF streams at once. Filter by event type, radio, and IMSI; click any event to open a zoomable log-context viewer showing the surrounding raw lines
+- **Major Events view** — a filtered timeline of just the meaningful transitions (radio connect/disconnect, 4G attach/detach, 5G register/deregister, PDU session up/down) instead of raw DEBUG noise, across all 17 NF streams at once. Filter by event type, radio, and IMSI; click any event to open a zoomable log-context viewer showing the surrounding raw lines
 - **Syslog Forwarding** — forwards all Open5GS, GenieACS, and FRR logs to a remote syslog server (e.g. Graylog) via rsyslog. Detects/installs rsyslog automatically, writes a dedicated drop-in config that never touches your existing rsyslog setup, and self-heals the AppArmor and file-permission issues that otherwise silently block it
 - **Log Download & Debug Bundle** — download raw logs by service/date range, or a one-click debug bundle for bug reports
 
@@ -390,6 +390,12 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Optional external SIP trunk + inbound DID mapping** — a real, off-host-reachable transport and firewall allowlist, all 4 buildable phases shipped, real provider connection deliberately not yet configured
 - **Cross-RAN Calling** — one toggle peers this instance with Asterisk-2G, bridging 4G/5G and 2G short codes across both Asterisk instances with real AMR/AMR-WB↔GSM-FR transcoding, confirmed live with real over-the-air calls in both directions
 
+![PSTN Gateway Overview](docs/screenshots/pstn-gateway-overview.png)
+
+![PSTN Extensions](docs/screenshots/pstn-extensions.png)
+
+![PSTN External Trunk](docs/screenshots/pstn-external-trunk.png)
+
 ### 2G GSM (Osmocom) *(Alpha)*
 
 > ⚠️ **Real radio module.** Real spectrum transmission on real GSM hardware is a bigger blast radius than a broken lab feature — `ENABLE_GSM_MODULE` defaults **disabled** (opt-in).
@@ -398,6 +404,10 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Real voice calling** needs a second, fully isolated Asterisk instance (Asterisk-2G) — osmo-msc's own built-in call handler can complete signaling but never implements real RTP audio (an upstream Osmocom limitation, not fixable in this project)
 - One button installs, configures, and wires everything needed for 2G↔2G voice with real audio
 - If a real call ever fails at channel assignment, it is **not necessarily a hardware problem** — a real `codec-support`/AMR configuration mismatch caused exactly this symptom once and had been misdiagnosed as unfixable hardware the day before
+
+![2G GSM Overview](docs/screenshots/gsm-overview.png)
+
+![2G Voice](docs/screenshots/gsm-2g-voice.png)
 
 ### 3G UMTS (OsmoHNBGW) *(Alpha)*
 
@@ -408,6 +418,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - A software test HNB (OsmoHNodeB) is deployable from the module's own page — proved a full live registration end-to-end before any real 3G hardware was ever touched
 - Real hardware target: an ip.access nano3G, which self-registers once pointed at this gateway (no remote-provisioning push, unlike 2G's OML)
 
+![3G UMTS Overview](docs/screenshots/hnb-overview.png)
+
 ### RF Planning *(Alpha)*
 
 > ⚠️ **Early and actively being built out.** Expect incomplete phases and possible breaking changes between releases.
@@ -416,12 +428,18 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - Not yet a full replacement for a commercial planning suite — treat outputs as a starting point, not a final design
 - `ENABLE_RF_PLANNING_MODULE` defaults **disabled** (opt-in)
 
+![RF Planning Overview](docs/screenshots/rf-planning-overview.png)
+
 ### IP Plan Tool *(Beta)*
 
 - **Bulk re-address a whole deployment from one page**, instead of visiting every module's own page to re-type the same new subnet
 - **Propose → Review → Apply** — never silently overwrites a module's own IP; proposes a plan against the current live state of every module, shows a current-vs-proposed diff, and only touches anything you explicitly check
 - Covers core-17 (MME/AMF/UPF/SGW addresses), Security Gateway, VoWiFi, 2G GSM, IMS, PSTN's external trunk, and MMS — SEPP and the DNS listen address are always plan-only, since their only live-apply path is a much larger action better done from their own dedicated pages
 - Live per-row restart-cost hints before you apply anything
+
+![IP Plan — Current](docs/screenshots/ip-plan-current.png)
+
+![IP Plan — Proposed](docs/screenshots/ip-plan-proposed.png)
 
 ### RAN Kill Switches *(Beta)*
 
@@ -431,6 +449,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **4G/5G/3G** sever the radio's own path to the core on this host only (nftables) — the radio itself is never touched and can be restored instantly
 - **2G is genuinely different** — it's a real administrative lock at osmo-bsc itself, dropping every camped UE immediately, the same real device-level action as the per-radio Block button on the RAN page
 - The same flash-red "currently blocked" indicator also applies to every individual per-radio Block/Unblock button on the RAN page, not just the Dashboard's aggregate buttons
+
+![RAN Kill Switches](docs/screenshots/ran-kill-switches.png)
 
 ### SigScale OCS (Online Charging) *(Beta)*
 
@@ -442,6 +462,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - No rating-plan/balance/subscriber CRUD in this NMS — links out to OCS's own Polymer web GUI and REST API docs instead
 - Getting real charging fully working (both Gy and Ro) surfaced and fixed 9 separate real bugs across freeDiameter-vs-cdp connectivity quirks and the compiled `ims_charging.so` module itself — see `docs/features.md` for the full writeup
 
+![SigScale OCS Setup](docs/screenshots/ocs-setup.png)
+
 ### Charging Plans *(Beta)*
 
 > ⚠️ **Beta.** Depends on SigScale OCS being installed and configured first.
@@ -452,6 +474,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - Subscriber assignment from the Subscribers page, both bulk-select and per-row
 - A known, still-unresolved OCS-side rating-engine bug can leak stuck reservations across subscribers — mitigated by an automatic background guard that sweeps and clears stale reservations every 30 minutes (a mitigation, not a fix for the underlying engine bug)
 
+![Charging Plans](docs/screenshots/charging-plans.png)
+
 ### Call History (CDR) *(Beta)*
 
 > ⚠️ **Beta.** One of three phases is not yet confirmed working end-to-end — see below.
@@ -461,6 +485,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Phase 2 (Asterisk-2G)** — code deployed, but a real end-to-end test-call confirmation is still outstanding
 - **Phase 3 (direct 4G/5G IMS-to-IMS calls)** — via Kamailio's own `acc` module, confirmed fully working end-to-end against real test calls, independent runtime toggle from its own compile-time build flag
 - Configurable retention (default 180 days)
+
+![Call History](docs/screenshots/call-history.png)
 
 ---
 
@@ -616,7 +642,7 @@ The Open5GS NMS follows a **Clean Architecture** pattern with clear separation o
 ┌─────────────────────────────────────────────────────────────┐
 │  nginx Reverse Proxy (Alpine)                                │
 │  Proxies /api → backend:3001                                 │
-│  Upgrades WebSocket → backend:3002                           │
+│  Upgrades WebSocket → backend:3001 (same port, in-process)   │
 └───────────────┬──────────────────┬──────────────────────────┘
                 │                  │
                 ▼                  ▼
@@ -666,7 +692,7 @@ COOKIE_SECURE=false                 # Set true only for HTTPS deployments
 
 # Backend
 PORT=3001
-WS_PORT=3002
+WS_PORT=3002                        # vestigial — WebSocket is upgraded in-process on PORT, not a separate listener
 MONGODB_URI=mongodb://127.0.0.1:27017/open5gs
 CONFIG_PATH=/etc/open5gs
 LOG_LEVEL=info

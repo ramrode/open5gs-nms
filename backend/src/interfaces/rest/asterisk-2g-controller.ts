@@ -453,9 +453,38 @@ async function withGsm2gExtensions<T>(mongoUri: string, fn: (col: Collection<Gsm
   }
 }
 
-function extensions2gConf(msisdnMatchPattern: string, echoTestNumber: string, shortCodes: { extension: string; subscriberMsisdn: string }[], crossRanPeerCodes: { extension: string; label?: string }[]): string {
+function extensions2gConf(msisdnMatchPattern: string, echoTestNumber: string, shortCodes: { extension: string; subscriberMsisdn: string }[], crossRanPeerCodes: { extension: string; label?: string }[], subscriberMsisdns: string[]): string {
   const shortCodeBlocks = shortCodes.map(e => `exten => ${e.extension},1,NoOp(2G Short Code -> ${e.subscriberMsisdn})
  same => n,Dial(PJSIP/${e.subscriberMsisdn}@sipconn,30)
+ same => n,Hangup()
+`).join('\n');
+
+  // Real bug found live 2026-09-21: msisdnMatchPattern defaults to the
+  // maximally-generic '_X.', so ANY dialed digit string that isn't one of
+  // the exact matches above — including a genuine external PSTN number,
+  // never just another subscriber's own MSISDN as the catch-all's original
+  // design assumed — fell into it and got re-dialed back out through
+  // sipconn. osmo-sip-connector relays that to osmo-msc as an MNCC
+  // mobile-terminated SETUP_REQ toward those digits, which correctly
+  // rejects it ("rx MNCC_SETUP_REQ for unknown subscriber number",
+  // confirmed live in osmo-msc's own journal) — the call fails instantly,
+  // never even reaching the real PSTN trunk. Fix: generate one exact-match
+  // extension per currently-known subscriber MSISDN (same idiom as
+  // shortCodeBlocks/crossRanBlocks above — Asterisk always tries an exact
+  // literal match before any pattern), so a real subscriber MSISDN still
+  // routes via sipconn exactly as before, and change the pattern catch-all
+  // itself to route anything else to pstn_trunk instead — reaching PSTN
+  // Gateway's own [pstn-internal] _X. catch-all (external_trunk +
+  // outbound-caller-ID DB lookup keyed by the caller's IMSI), the same real
+  // external-dialing mechanism 4G/5G subscribers already use. NOT yet
+  // confirmed live end-to-end past this dialplan hop — whether
+  // CALLERID(num) arriving at PSTN's side is the caller's IMSI (what its
+  // own DB lookup expects) or MSISDN (what a 2G-originated call's SIP
+  // identity is built from here) has not been verified with a real test
+  // call; if the call reaches PSTN's side but still gets Busy()'d, check
+  // that first.
+  const subscriberMsisdnBlocks = Array.from(new Set(subscriberMsisdns)).map(msisdn => `exten => ${msisdn},1,NoOp(2G-to-2G/4G/5G: dialing known subscriber ${msisdn} via osmo-sip-connector)
+ same => n,Dial(PJSIP/${msisdn}@sipconn,30)
  same => n,Hangup()
 `).join('\n');
 
@@ -486,9 +515,9 @@ exten => ${echoTestNumber},1,NoOp(2G Echo Test)
 
 ${shortCodeBlocks}
 ${crossRanBlocks}
-exten => ${msisdnMatchPattern},1,NoOp(2G-to-2G: re-dialing \${EXTEN} back through osmo-sip-connector)
- same => n,Set(CALLERID(num)=\${CALLERID(num)})
- same => n,Dial(PJSIP/\${EXTEN}@sipconn,30)
+${subscriberMsisdnBlocks}
+exten => ${msisdnMatchPattern},1,NoOp(External PSTN: routing \${EXTEN} out via PSTN Gateway's own external trunk)
+ same => n,Dial(PJSIP/\${EXTEN}@pstn_trunk,30)
  same => n,Hangup()
 `;
 }
@@ -547,7 +576,9 @@ async function regenerateExtensions2g(mongoUri: string, subscriberRepo: ISubscri
   const echoTestNumber = state?.echoTestNumber ?? STATE_DEFAULTS.echoTestNumber;
   const shortCodes = await resolveGsm2gShortCodes(mongoUri, subscriberRepo);
   const crossRanPeerCodes = await getCrossRanPeerCodes(mongoUri);
-  fs.writeFileSync(`${HOST_ROOT}${A2G_EXTEN}`, extensions2gConf(msisdnMatchPattern, echoTestNumber, shortCodes, crossRanPeerCodes), 'utf-8');
+  const allSubs = await subscriberRepo.findAllFull();
+  const subscriberMsisdns = allSubs.map(s => s.msisdn?.[0]).filter((m): m is string => !!m);
+  fs.writeFileSync(`${HOST_ROOT}${A2G_EXTEN}`, extensions2gConf(msisdnMatchPattern, echoTestNumber, shortCodes, crossRanPeerCodes, subscriberMsisdns), 'utf-8');
   await nsenter('asterisk', ['-C', A2G_CONF, '-rx', 'dialplan reload']).catch(() => {});
 }
 
@@ -772,9 +803,11 @@ export async function configureAsterisk2g(
       crossRanPeer = getPstnBindAddress();
     }
     const crossRanPeerCodes = await getCrossRanPeerCodes(mongoUri);
+    const allSubsForMsisdns = await subscriberRepo.findAllFull();
+    const subscriberMsisdns = allSubsForMsisdns.map(s => s.msisdn?.[0]).filter((m): m is string => !!m);
     fs.writeFileSync(`${HOST_ROOT}${A2G_CONF}`, asterisk2gConfTemplate(astmoddir, astdatadir), 'utf-8');
     fs.writeFileSync(`${HOST_ROOT}${A2G_PJSIP}`, pjsip2gConf(bindIp, bindPort, peer.ip, peer.port, crossRanPeer), 'utf-8');
-    fs.writeFileSync(`${HOST_ROOT}${A2G_EXTEN}`, extensions2gConf(msisdnMatchPattern, echoTestNumber, shortCodes, crossRanPeerCodes), 'utf-8');
+    fs.writeFileSync(`${HOST_ROOT}${A2G_EXTEN}`, extensions2gConf(msisdnMatchPattern, echoTestNumber, shortCodes, crossRanPeerCodes, subscriberMsisdns), 'utf-8');
     fs.writeFileSync(`${HOST_ROOT}${A2G_RTP}`, rtp2gConf(), 'utf-8');
     ensureChanSipDisabled2g();
     await chownConfigFiles();

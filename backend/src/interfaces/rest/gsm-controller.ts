@@ -650,6 +650,16 @@ function btsBlock(e: BtsEntry, index: number, sgsnGbRemoteIp = ''): string {
     .filter(n => Number.isInteger(n) && n >= 0 && n <= 65535)
     .map(n => `  si2quater neighbor-list add earfcn ${n} thresh-hi 20 thresh-lo 10 prio 6 qrxlv 22 meas 0\n`)
     .join('');
+  // radio-link-timeout raised from an original 32 to the real VTY-confirmed
+  // max (`radio-link-timeout ?` on osmo-bsc: <4-64>, plus a test-only
+  // 'infinite' deliberately not used — a truly dead link would then never
+  // release its channel at all, worse than the problem this mitigates). A
+  // real, repeated, intermittent T200/N200 exhaustion -> "Radio Link
+  // Failure" was found live 2026-09-21 dropping otherwise-healthy calls on
+  // this BTS's real hardware, alternating unpredictably between the two 2G
+  // UEs under test — not tied to one specific device. Mitigation only (more
+  // tolerance for a marginal link before declaring failure), not a fix for
+  // whatever's causing the marginal RF condition itself.
   return ` bts ${index}
   type ${btsTypeFor(e.backend)}
   band ${e.band}
@@ -659,7 +669,7 @@ function btsBlock(e: BtsEntry, index: number, sgsnGbRemoteIp = ''): string {
   ms max power 15
   cell reselection hysteresis 4
   rxlev access min 0
-  radio-link-timeout 32
+  radio-link-timeout 64
   channel allocator ascending
   rach tx integer 9
   rach max transmission 7

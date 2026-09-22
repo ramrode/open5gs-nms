@@ -33,7 +33,7 @@ Guide for developers contributing to or extending Open5GS NMS.
 
 ```bash
 # Clone the repository
-git clone https://github.com/YOUR_ORG/open5gs-nms.git
+git clone https://github.com/paulmataruso/open5gs-nms.git
 cd open5gs-nms
 
 # Install backend dependencies
@@ -49,30 +49,29 @@ npm install
 
 ```bash
 cd backend
-
-# Copy environment template
-cp .env.example .env
-
-# Edit .env for local development
-nano .env
 ```
 
-**backend/.env:**
-```bash
-NODE_ENV=development
-PORT=3001
-WS_PORT=3002
-MONGODB_URI=mongodb://127.0.0.1:27017/open5gs
-CONFIG_PATH=/etc/open5gs
-LOG_LEVEL=debug
-HOST_SYSTEMCTL_PATH=/usr/bin/systemctl
-```
+Config is read directly from `process.env` (see `src/config/index.ts`) — there's
+no `dotenv`-style `.env` auto-loading for local `npm run dev` (that's a Docker
+Compose-only convenience, via the root `.env` file read by `docker-compose.yml`).
+Sensible defaults are baked in for local development (MongoDB at
+`127.0.0.1:27017/open5gs`, port `3001`, etc.), so for most local dev you can
+just run it as-is:
 
-Start development server:
 ```bash
 npm run dev
 # Server runs on http://localhost:3001 with hot reload
 ```
+
+To override anything, export it before running:
+```bash
+NODE_ENV=development LOG_LEVEL=debug npm run dev
+```
+
+Real variables read (with their defaults): `PORT` (3001), `WS_PORT` (3002 —
+vestigial, the WebSocket upgrade actually shares `PORT`, not a separate
+listener), `MONGODB_URI`, `CONFIG_PATH`, `BACKUP_PATH`, `MONGO_BACKUP_PATH`,
+`LOG_LEVEL`, `LOG_DIR`, `HOST_SYSTEMCTL_PATH`.
 
 ### Frontend Development
 
@@ -89,7 +88,7 @@ nano .env
 **frontend/.env:**
 ```bash
 VITE_API_URL=http://localhost:3001
-VITE_WS_URL=ws://localhost:3002
+VITE_WS_URL=ws://localhost:3001
 ```
 
 Start development server:
@@ -133,6 +132,7 @@ backend/
 │   │   ├── interfaces/      # Abstract contracts (repos, host executor)
 │   │   ├── services/        # Domain services (validation schemas, ip-utils, topology)
 │   │   ├── sas/             # CBRS SAS (Spectrum Access System) logic
+│   │   ├── rf/              # RF Planning link-budget/site-geometry engine
 │   │   └── value-objects/   # Immutable value types
 │   │
 │   ├── application/         # Use case orchestration
@@ -573,11 +573,16 @@ docker compose build --no-cache
 export NODE_ENV=production
 
 # Build optimized images
-docker compose -f docker-compose.yml -f docker-compose.prod.yml build
+docker compose build
 
 # Start production stack
-docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+docker compose up -d
 ```
+
+There is only one `docker-compose.yml` in this repo — no separate `-prod`
+overlay file. `NODE_ENV`/other production-relevant values are set via the
+root `.env` file (or exported in the shell) and read by that same compose
+file.
 
 ---
 

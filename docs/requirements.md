@@ -289,7 +289,8 @@ Open5GS configuration files **must** be located at:
 ├── hss.yaml
 ├── pcrf.yaml
 ├── sgwc.yaml
-└── sgwu.yaml
+├── sgwu.yaml
+└── sepp1.yaml
 ```
 
 **Custom Paths:**
@@ -319,6 +320,7 @@ open5gs-hssd.service
 open5gs-pcrfd.service
 open5gs-sgwcd.service
 open5gs-sgwud.service
+open5gs-seppd.service
 ```
 
 ### MongoDB Configuration
@@ -554,7 +556,7 @@ mongo --eval "db.adminCommand('ping')"
 
 **Network Issues:**
 ```bash
-sudo netstat -tlnp | grep -E '8888|3001|3002|27017'
+sudo netstat -tlnp | grep -E '8888|3001|27017'
 nslookup registry.npmjs.org
 ping -c 4 8.8.8.8
 ```

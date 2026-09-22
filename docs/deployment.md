@@ -303,9 +303,8 @@ sudo ufw allow 443/tcp
 # (or use DNS challenges instead)
 sudo ufw allow 80/tcp
 
-# Deny direct access to backend ports
+# Deny direct access to backend port
 sudo ufw deny 3001/tcp
-sudo ufw deny 3002/tcp
 
 # Check status
 sudo ufw status numbered
@@ -683,7 +682,7 @@ cd /opt/open5gs-nms
 
 # Pull latest changes
 git fetch
-git checkout v1.0.1  # Or specific version
+git checkout v2.0-beta_0.60  # Or specific version — see `git tag` for the real current list
 
 # Rebuild images
 docker compose build
@@ -716,7 +715,7 @@ If update fails:
 docker compose down
 
 # Checkout previous version
-git checkout v1.0.0
+git checkout v2.0-beta_0.59
 
 # Rebuild
 docker compose build
@@ -776,8 +775,8 @@ Final verification before going live:
 ## Support
 
 For production deployment assistance:
-- **GitHub Issues:** https://github.com/YOUR_ORG/open5gs-nms/issues
-- **GitHub Discussions:** https://github.com/YOUR_ORG/open5gs-nms/discussions
+- **GitHub Issues:** https://github.com/paulmataruso/open5gs-nms/issues
+- **GitHub Discussions:** https://github.com/paulmataruso/open5gs-nms/discussions
 - **Documentation:** [docs/](.)
 
 **Remember:** Production deployments require careful planning and testing. When in doubt, test in a staging environment first!

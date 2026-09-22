@@ -1088,7 +1088,7 @@ Get recent log lines from a specific NMS container.
 
 ## WebSocket
 
-The WebSocket server runs on port `3002` (proxied via nginx at `ws://YOUR_SERVER:8888/ws`).
+The WebSocket server shares the backend's REST port `3001` (upgraded in-process on the same HTTP server, not a separate listener), proxied via nginx at `ws://YOUR_SERVER:8888/ws`.
 
 Used for real-time log streaming and service status updates. Authenticate before connecting — the WebSocket connection shares the same session cookie as HTTP.
 
@@ -1191,12 +1191,35 @@ for the exact routes.
 | `/api/frr`, `/api/frr/source-build` | FRR routing config, migration wizard, source-build/patch | `frr-controller.ts`, `frr-source-build-controller.ts` |
 | `/api/sms` | SMS over SGs (osmo-msc/osmo-hlr) install/config | `sms-controller.ts` |
 | `/api/ims` | IMS/VoLTE (PyHSS, Kamailio) install/config | `ims-controller.ts` |
-| `/api/pstn` | **Beta**, internal-only — PSTN Gateway (Asterisk) install/config + extension→subscriber mapping. No public SIP trunk connectivity. Defaults disabled (`ENABLE_PSTN_MODULE=false`) | `pstn-controller.ts` |
+| `/api/pstn` | **Stable** — PSTN Gateway (Asterisk) install/config, internal short-code/MSISDN dialing, Cross-RAN Calling, external SIP trunk + inbound DID mapping (real provider connectivity not configured on this deployment, mechanism itself confirmed working). Defaults disabled (`ENABLE_PSTN_MODULE=false`) | `pstn-controller.ts` |
 | `/api/vowifi` | VoWiFi/ePDG (osmo-epdg, strongSwan) install/config | `vowifi-controller.ts` |
 | `/api/swu-emulator` | SWu (IKEv2/EAP-AKA) emulator for VoWiFi testing | `swu-emulator-controller.ts` |
-| `/api/validation` | UE Validation (UERANSIM/srsRAN load/session testing) | `validation-controller.ts` |
+| `/api/validation`, `/api/validation/*` | UE Validation (UERANSIM/srsRAN load/session testing), plus VoLTE/QCI/VoWiFi/IMS-test-number sub-routers | `validation-controller.ts` + related |
 | `/api/subscriber-groups` | Subscriber grouping/tagging for the subscriber list | `subscriber-groups-controller.ts` |
 | `/api/logs` | Log download, debug bundles, unified log context | `log-download-controller.ts` |
+| `/api/plmn-migration` | PLMN (MCC/MNC) migration | `plmn-migration-controller.ts` |
+| `/api/pcap` | Packet capture start/stop/download | `pcap-controller.ts` |
+| `/api/rf-planning`, `/api/rf-planning/projects` | RF Planning link-budget engine, projects, reports | `rf-planning-controller.ts`, `rf-planning-projects-controller.ts`, `rf-planning-reports-controller.ts` |
+| `/api/apn-profiles` | APN profile management | `apn-profile` use case/controller |
+| `/api/radio-block`, `/api/gnb-block`, `/api/hnb-block`, `/api/ue-block` | RAN Kill Switches — per-generation (4G/5G/3G) and per-UE nftables blocking | `radio-block-controller.ts`, `gnb-block-controller.ts`, `hnb-block-controller.ts`, `ue-block` controller |
+| `/api/docker` | Docker container log streaming | `docker-controller.ts` |
+| `/api/speedtest` | Speedtest | `speedtest-controller.ts` |
+| `/api/ip-plan` | IP Plan Tool — propose/review/apply bulk re-addressing | `ip-plan-controller.ts` |
+| `/api/gsm` | 2G GSM (Osmocom osmo-bsc/osmo-bts/osmo-msc) install/config | `gsm-controller.ts` |
+| `/api/asterisk-2g` | Asterisk-2G (real 2G↔2G voice audio bridge) | `asterisk-2g-controller.ts` |
+| `/api/mms` | MMS (VectorCore MMSC) install/config | `mms-controller.ts` |
+| `/api/vectorcore-smsc` | VectorCore SMSC (2G↔4G SMS) | `vectorcore-smsc` controller |
+| `/api/secgw` | Security Gateway (SecGW) IPsec tunnel install/config | `secgw-controller.ts` |
+| `/api/hnbgw` | 3G UMTS (OsmoHNBGW) install/config | `hnbgw-controller.ts` |
+| `/api/ocs` | SigScale OCS (Diameter Gy/Ro online charging) install/config | `ocs-controller.ts` |
+| `/api/charging-plans` | Charging Plans (simplified data/voice cap GUI over OCS) | `charging-plans-controller.ts` |
+| `/api/cdr` | Call History (unified CDR across PSTN/2G/IMS) | `cdr-controller.ts` |
+| `/api/traffic-history` | Traffic History (Prometheus-backed aggregate + per-subscriber) | `traffic-history-controller.ts` |
+| `/api/twamp` | TWAMP network performance testing | `twamp-controller.ts` |
+| `/api/modules` | Module "Fix All"/staleness reconciliation | `modules-controller.ts` |
+| `/api/radio-signal` | UE Signal Monitoring (per-UE RSRP/RSRQ/SINR/etc.) | `radio-signal-controller.ts` |
+| `/api/snmp` | SNMP Monitoring | `snmp-controller.ts` |
+| `/api/sas` | CBRS SAS server admin | `sas-controller.ts` (via `createSasAdminRouter`) |
 
 All are `requireAdmin`-gated like the rest of the API unless noted otherwise in the
 controller itself.

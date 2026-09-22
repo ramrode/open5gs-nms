@@ -298,8 +298,7 @@ function removeZoneRecordLine(raw: string, name: string): string {
 // epdg.yaml — field values per the real vendor-shipped example config (fetched and
 // read directly, not guessed), mapped onto this project's PLMN/HSS/SMF constants the
 // same way ims-controller.ts's template functions map PLMN constants into Kamailio
-// config. See docs/vectorcore-epdg-integration-plan.md §5.2 for the full field-by-field
-// reasoning; only the load-bearing decisions are called out inline below.
+// config. Only the load-bearing decisions are called out inline below.
 function epdgYamlConf(opts: {
   epdgIp: string; mcc: string; mnc: string; realm: string;
   aaaListenIp: string; smfGtpcIp: string; swmLocalIp: string;

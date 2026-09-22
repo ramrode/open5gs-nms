@@ -55,13 +55,13 @@ Instances of unacceptable behavior may be reported to the project maintainers. A
 You don't need to be a developer to contribute! Here are many ways to help:
 
 **🐛 Report Bugs**
-- Found a bug? [Open an issue](https://github.com/YOUR_ORG/open5gs-nms/issues/new?template=bug_report.md)
+- Found a bug? [Open an issue](https://github.com/paulmataruso/open5gs-nms/issues/new?template=bug_report.md)
 - Provide detailed steps to reproduce
 - Include screenshots if applicable
 - Mention your environment (OS, Open5GS version, etc.)
 
 **💡 Suggest Features**
-- Have an idea? [Request a feature](https://github.com/YOUR_ORG/open5gs-nms/issues/new?template=feature_request.md)
+- Have an idea? [Request a feature](https://github.com/paulmataruso/open5gs-nms/issues/new?template=feature_request.md)
 - Explain the problem you're trying to solve
 - Describe your proposed solution
 - Consider implementation complexity
@@ -106,7 +106,7 @@ You don't need to be a developer to contribute! Here are many ways to help:
    ```
 3. Add upstream remote:
    ```bash
-   git remote add upstream https://github.com/YOUR_ORG/open5gs-nms.git
+   git remote add upstream https://github.com/paulmataruso/open5gs-nms.git
    ```
 
 ### Backend Development
@@ -150,20 +150,21 @@ docker compose up --build
 
 Create `.env` files for local development:
 
-**backend/.env**
+Backend reads `process.env` directly — no `dotenv` auto-loading in local dev, so
+export these rather than relying on a `.env` file (see `docs/development.md`
+for the full explanation):
 ```bash
 NODE_ENV=development
 PORT=3001
-WS_PORT=3002
 MONGODB_URI=mongodb://127.0.0.1:27017/open5gs
 CONFIG_PATH=/etc/open5gs
 LOG_LEVEL=debug
 ```
 
-**frontend/.env**
+**frontend/.env** (Vite does auto-load this one):
 ```bash
 VITE_API_URL=http://localhost:3001
-VITE_WS_URL=ws://localhost:3002
+VITE_WS_URL=ws://localhost:3001
 ```
 
 ---
@@ -174,7 +175,7 @@ VITE_WS_URL=ws://localhost:3002
 
 - Look for issues labeled `good first issue` for beginner-friendly tasks
 - Issues labeled `help wanted` need contributors
-- Check the [project board](https://github.com/YOUR_ORG/open5gs-nms/projects) for planned work
+- Check the [project board](https://github.com/paulmataruso/open5gs-nms/projects) for planned work
 
 ### Before Starting Work
 
@@ -478,11 +479,9 @@ cd backend
 npm test
 npm run test:watch
 npm run test:coverage
-
-# Frontend
-cd frontend
-npm test
 ```
+
+The frontend currently has no test suite/script — `npm run lint` (ESLint) and `npm run build` (which runs `tsc` first) are the only automated checks available for frontend changes.
 
 ### Test Coverage
 
@@ -502,7 +501,7 @@ npm test
  * Applies new configuration to Open5GS network functions.
  * Creates automatic backup before applying and rolls back on failure.
  * 
- * @param configs - Complete configuration for all 16 network functions
+ * @param configs - Complete configuration for all 17 network functions
  * @returns Result object with success status, diff, and any errors
  * @throws {ValidationError} If configuration validation fails
  */

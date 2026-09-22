@@ -50,6 +50,75 @@ The full AGPL-3.0 license text is available at: https://www.gnu.org/licenses/agp
 
 ---
 
+<img src="https://github.com/osmocom.png" width="28" height="28" align="left" style="margin-right: 8px;">
+
+## Osmocom network daemons (osmo-msc, osmo-bsc, osmo-bts, osmo-hlr, osmo-sgsn, osmo-mgw, osmo-pcu, osmo-stp, osmo-hnbgw, osmo-sip-connector)
+
+**Copyright (C) Harald Welte, Holger Hans Peter Freyther, and the Osmocom project contributors**
+
+- **Source:** https://gitea.osmocom.org (and mirrored at https://github.com/osmocom)
+- **License:** GNU Affero General Public License v3.0 (AGPL-3.0) or later (confirmed directly from each package's own `copyright`/`COPYING` file on this deployment — `osmo-bsc`: `AGPL-3+`; `osmo-sip-connector` and `osmo-hnbgw`: AGPL-3.0)
+- **Usage:** This project's 2G GSM and 3G UMTS modules install and manage these daemons as real host systemd services (not bundled/vendored) to provide real GSM/UMTS radio access, SS7 signaling, subscriber HLR, and MNCC↔SIP voice bridging. Not installed unless the corresponding module is explicitly enabled.
+
+The full AGPL-3.0 license text is available at: https://www.gnu.org/licenses/agpl-3.0.html
+
+---
+
+<img src="https://www.kamailio.org/wiki/images/thumb/8/85/Kamailio-logo.png/64px-Kamailio-logo.png" width="28" height="28" align="left" style="margin-right: 8px;">
+
+## Kamailio
+
+**Copyright (C) The Kamailio Project (multiple individual and corporate copyright holders — see the project's own `COPYING` file)**
+
+- **Source:** https://github.com/kamailio/kamailio
+- **License:** GNU General Public License v2.0 (GPL-2.0)
+- **Usage:** This project's IMS/VoLTE module installs Kamailio as the P-CSCF/I-CSCF/S-CSCF signaling core, including several project-authored source patches (see `kamailio-ims-modules-build.ts`) built and deployed as compiled `.so` modules. Not bundled — built from the real Kamailio source package on the host.
+
+The full GPL-2.0 license text is available at: https://www.gnu.org/licenses/old-licenses/gpl-2.0.html
+
+---
+
+<img src="https://github.com/asterisk.png" width="28" height="28" align="left" style="margin-right: 8px;">
+
+## Asterisk
+
+**Copyright (C) Sangoma Technologies Corporation and the Asterisk project contributors**
+
+- **Source:** https://github.com/asterisk/asterisk
+- **License:** GNU General Public License v2.0, with Sangoma/Digium's linking exception (`GPL-2-Asterisk`)
+- **Usage:** This project's PSTN Gateway and Asterisk-2G modules each install and run a fully independent Asterisk instance (own config tree, own systemd unit) for B2BUA call bridging (internal extension dialing, Cross-RAN Calling, external SIP trunk, 2G↔2G voice audio). Real host package, not bundled.
+
+---
+
+<img src="https://github.com/oldiesoft.png" width="28" height="28" align="left" style="margin-right: 8px;">
+
+## PyHSS
+
+**Copyright (C) Nick Bone and PyHSS contributors**
+
+- **Source:** https://github.com/nickvsnetworking/pyhss
+- **License:** GNU Affero General Public License v3.0 (AGPL-3.0)
+- **Usage:** This project's IMS/VoLTE module installs PyHSS as the real HSS (Home Subscriber Server) for Cx/Sh Diameter interfaces, including project-authored crash-guard patches applied on every Install (see `ims-controller.ts`). Not bundled — installed separately on the host.
+
+The full AGPL-3.0 license text is available at: https://www.gnu.org/licenses/agpl-3.0.html
+
+---
+
+<img src="https://sigscale.org/favicon.ico" width="28" height="28" align="left" style="margin-right: 8px;">
+
+## SigScale OCS
+
+**Copyright (C) SigScale Global Inc.**
+
+- **Source:** https://github.com/sigscale/ocs
+- **Website:** https://sigscale.org
+- **License:** Apache License 2.0
+- **Usage:** This project's SigScale OCS module installs SigScale's real Erlang/OTP Online Charging System (via its own apt package) for Diameter Gy/Ro prepaid credit-control charging. Not bundled — installed separately on the host, opt-in and disabled by default.
+
+The full Apache-2.0 license text is available at: https://www.apache.org/licenses/LICENSE-2.0
+
+---
+
 <img src="https://github.com/vectorcore-mobile.png" width="28" height="28" align="left" style="margin-right: 8px;">
 
 ## VectorCore ePDG, VectorCore AAA, VectorCore MMSC

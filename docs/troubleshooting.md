@@ -297,7 +297,7 @@ sudo systemctl start mongod
 
 2. **Port conflict:**
 ```bash
-sudo netstat -tlnp | grep -E '8888|3001|3002'
+sudo netstat -tlnp | grep -E '8888|3001'
 ```
 
 3. **Missing volumes:**
@@ -584,8 +584,8 @@ WebSocket connection failed
 # Check WebSocket server
 docker compose logs backend | grep -i websocket
 
-# Verify WebSocket port
-docker compose exec backend netstat -tlnp | grep 3002
+# Verify the backend is listening (WebSocket shares the REST port, not a separate one)
+docker compose exec backend netstat -tlnp | grep 3001
 ```
 
 ---
@@ -880,6 +880,22 @@ in every case tested so far, but the underlying DUAL FSM inconsistency the patch
 around is not something this project can fully fix upstream — treat this as a real
 mitigation, not a guarantee it can never recur under a scenario not yet seen.
 
+**If you need to add a new EIGRP network statement, do not write `frr.conf` and
+`systemctl restart frr`** — confirmed live, this reliably triggers the exact
+crash above (twice in a row on the same change), because a restart makes
+`eigrpd` reprocess the *whole* topology during a fresh neighbor resync,
+which is what actually hits the FSM bug — not anything about the new
+statement itself. The safe, proven method is a **live `vtysh` edit**, which
+advertises the new network incrementally to the already-established
+neighbor and never tears down/resyncs the adjacency:
+```bash
+vtysh -c "configure terminal" -c "router eigrp 1" -c "network X.X.X.X/32" -c "end"
+vtysh -c "write memory"
+```
+This project's own DNS/FQDN Migration Wizard deliberately never auto-edits
+`frr.conf` for this reason — any EIGRP `network` statement addition is left
+as a manual operator step using the method above, not automated.
+
 ---
 
 ## DNS / BIND9 Issues
@@ -890,7 +906,7 @@ mitigation, not a guarantee it can never recur under a scenario not yet seen.
 `bsf`, `nssf`, `sepp1` — anything the DNS/FQDN Migration Wizard's Phase C touched) fails
 to start with something like:
 ```
-[sock] ERROR: getaddrinfo(0:nrf.5gc.mnc070.mcc999.3gppnetwork.org:7777:0x0) failed: Name or service not known
+[sock] ERROR: getaddrinfo(0:nrf.5gc.mnc001.mcc001.3gppnetwork.org:7777:0x0) failed: Name or service not known
 [sbi] FATAL: ogs_sbi_context_parse_server_config: Assertion `rv == OGS_OK' failed.
 ```
 
@@ -1429,14 +1445,14 @@ mongo --eval "db.adminCommand('ping')" > mongo.log 2>&1
 ### Getting Support
 
 - **Documentation:** Check [docs/](.) directory
-- **GitHub Issues:** https://github.com/YOUR_ORG/open5gs-nms/issues
-- **GitHub Discussions:** https://github.com/YOUR_ORG/open5gs-nms/discussions
+- **GitHub Issues:** https://github.com/paulmataruso/open5gs-nms/issues
+- **GitHub Discussions:** https://github.com/paulmataruso/open5gs-nms/discussions
 - **Open5GS Forum:** https://open5gs.org/open5gs/forum/
 
 ### Reporting Bugs
 
 Use the bug report template:
-https://github.com/YOUR_ORG/open5gs-nms/issues/new?template=bug_report.md
+https://github.com/paulmataruso/open5gs-nms/issues/new?template=bug_report.md
 
 Include:
 - Steps to reproduce

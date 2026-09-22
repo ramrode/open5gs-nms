@@ -375,7 +375,59 @@ services**, not containers. This is not a toy/demo app: it manages real CBRS rad
     should hold for any future cdp-based Diameter peer this project adds,
     not just OCS.
 
-## Feature inventory (as of v2.0-beta_0.61, 2026-09-21)
+19. **osmo-sip-connector's `MNCC_SETUP_COMPL_IND` has a real hardcoded 5s
+    timer a genuine over-the-air CONNECT round trip can legitimately
+    exceed — and Asterisk-2G's `_X.` catch-all had no real route to the
+    external PSTN trunk at all.** Two separate, real bugs found chasing a
+    "2G call rings/answers but never connects, then hangs up" report
+    (confirmed live 2026-09-21): (1) `mncc.c`'s generic `start_cmd_timer()`
+    (`/opt/osmo-sip-connector-build/osmo-sip-connector/src/mncc.c`, tag
+    1.6.1) hardcodes 5s for several "wait for the next expected MNCC
+    message" cases, including the originating leg's own
+    `MNCC_SETUP_COMPL_IND` right after the callee answers — real GSM
+    scheduling routinely exceeds that under normal (not faulty)
+    conditions, tearing down a call both legs had just marked connected
+    (`command(0x106) never arrived for leg(...)`). Widened to 15s for just
+    that call site via a new `start_cmd_timer_t()` helper (every other
+    caller — RTP_CREATE, REL_CNF, REL_IND — stays at the original 5s);
+    baked into `osmo-sip-connector-build.ts` (`BUILD_REV` 2,
+    `SIPCONN_SETUP_COMPL_TIMEOUT_PATCH`) so a reinstall picks it up too.
+    (2) Asterisk-2G's `[2g-loopback]` dialplan (`extensions2gConf()` in
+    `asterisk-2g-controller.ts`) never had a real path to an external PSTN
+    number — its `_X.` catch-all was built only for "2G subscriber dials
+    another known subscriber's raw MSISDN" and looped ANY unmatched digit
+    string (including a genuine external number) back through `sipconn`,
+    which osmo-msc correctly rejected as `rx MNCC_SETUP_REQ for unknown
+    subscriber number` — the call died instantly, never reaching PSTN at
+    all. Fixed by generating one exact-match extension per known
+    subscriber MSISDN (Asterisk always tries an exact match before a
+    pattern — same idiom the file already used for short codes) and
+    pointing the `_X.` catch-all itself at `pstn_trunk` instead — reaching
+    PSTN Gateway's own `[pstn-internal]` `_X.` catch-all (`external_trunk`
+    + its existing IMSI-keyed outbound-caller-ID DB lookup), confirmed
+    live: calls now actually reach and ring a real external number in
+    both directions. **What's still open, confirmed NOT fixed by either
+    patch above:** a real, intermittent 2G radio-link reliability
+    problem — genuine `abis_rsl.c` `Timer T200 expired (N200+1) times` →
+    `CONNECTION FAIL (cause=Radio Link Failure)` on the BTS's own real
+    hardware, hitting BOTH 2G UEs under test unpredictably (not one
+    specific device) — is still dropping some calls mid-setup or
+    mid-connect, sometimes with no user-visible signaling error at all (a
+    still-open case showed a clean `MNCC_HOLD_IND`/"leg is requesting
+    hold" from a real handset — genuine over-the-air Hold behavior, not
+    this project's own code — right after connecting, which reads exactly
+    like "connects but no audio"). As a mitigation (not a fix — the real
+    cause is still open), `radio-link-timeout` in the generated
+    `osmo-bsc.cfg` (`gsm-controller.ts`) was raised from 32 to 64
+    (osmo-bsc's real VTY-confirmed max via `radio-link-timeout ?`; the
+    test-only `infinite` option was deliberately not used — a truly dead
+    link would then never release its channel at all). If a 2G call still
+    intermittently fails after this, suspect the BTS's own hardware/RF
+    condition next, not this project's code — swapping the physical
+    nanoBTS unit is one of the next steps under consideration as of this
+    date.
+
+## Feature inventory (as of v2.0-beta_0.62, 2026-09-22)
 
 | Feature | Status | Key backend files | Key frontend files |
 |---|---|---|---|

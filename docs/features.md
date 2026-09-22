@@ -25,17 +25,18 @@ Detailed documentation for all Open5GS NMS features.
 17. [PSTN / Voice Gateway](#pstn--voice-gateway)
 18. [VoWiFi (ePDG)](#vowifi-epdg)
 19. [SMS over SGs](#sms-over-sgs)
-20. [UE Validation](#ue-validation)
-21. [Security Gateway (SecGW)](#security-gateway-secgw)
-22. [RF Planning](#rf-planning)
-23. [IP Plan Tool](#ip-plan-tool)
-24. [RAN Kill Switches (Dashboard)](#ran-kill-switches-dashboard)
-25. [SigScale OCS (Online Charging, Diameter Gy + Ro)](#sigscale-ocs-online-charging-diameter-gy--ro)
-26. [Charging Plans](#charging-plans)
-27. [Call History (CDR)](#call-history-cdr)
-28. [Traffic History](#traffic-history)
-29. [UE Signal Monitoring](#ue-signal-monitoring)
-30. [SNMP Monitoring](#snmp-monitoring)
+20. [MMS](#mms)
+21. [UE Validation](#ue-validation)
+22. [Security Gateway (SecGW)](#security-gateway-secgw)
+23. [RF Planning](#rf-planning)
+24. [IP Plan Tool](#ip-plan-tool)
+25. [RAN Kill Switches (Dashboard)](#ran-kill-switches-dashboard)
+26. [SigScale OCS (Online Charging, Diameter Gy + Ro)](#sigscale-ocs-online-charging-diameter-gy--ro)
+27. [Charging Plans](#charging-plans)
+28. [Call History (CDR)](#call-history-cdr)
+29. [Traffic History](#traffic-history)
+30. [UE Signal Monitoring](#ue-signal-monitoring)
+31. [SNMP Monitoring](#snmp-monitoring)
 
 ---
 
@@ -1006,6 +1007,27 @@ before this existed.
   directory instead of the real, shared, package-installed `/usr/share/
   asterisk` — Asterisk's Stasis subsystem needs real documentation files
   there and refused to start without them ("Stasis initialization failed").
+- **`osmo-sip-connector`'s `MNCC_SETUP_COMPL_IND` had a hardcoded 5s
+  timeout** that a real over-the-air CONNECT↔CONNECT-ACK round trip could
+  legitimately exceed under normal GSM scheduling, tearing down a call both
+  legs had just marked connected. Widened to 15s for just that call site;
+  every other `start_cmd_timer()` caller stays at the original 5s. Baked
+  into the module's own build pipeline so a reinstall picks it up too.
+- **Asterisk-2G's dialplan had no real route to the external PSTN
+  trunk** — a 2G subscriber dialing a genuine external number fell into a
+  catch-all built only for "dial another known subscriber's raw MSISDN,"
+  looping the call back into `osmo-msc` as an unrecognized-subscriber
+  request instead of ever reaching PSTN. Fixed by routing anything that
+  isn't a known subscriber's own MSISDN out through the PSTN Gateway's
+  trunk instead.
+- **Still open, not yet resolved by either fix above**: a real,
+  intermittent 2G radio-link reliability problem (`Timer T200 expired` →
+  `Radio Link Failure`) on the BTS's own real hardware, affecting either 2G
+  UE under test unpredictably — occasionally severe enough that a call
+  connects with no audio, or drops mid-setup. `radio-link-timeout` was
+  raised from 32 to 64 (osmo-bsc's real configurable max) as a mitigation,
+  not a fix. If this resurfaces, it is not necessarily this project's code —
+  check the BTS's own hardware/RF condition first.
 
 ---
 
@@ -1262,6 +1284,47 @@ Server-side signaling is verified end-to-end against a test emulator (real SWx/S
 5. **Enable/Disable, Start/Stop/Restart** — full lifecycle control, plus a live service-status card for all three daemons
 
 Requires the UE to perform a **combined EPS/IMSI attach** (not EPS-only) so the MME establishes the SGs association needed for CS-fallback SMS.
+
+---
+
+## MMS
+
+> **Beta.** Real end-to-end MMS confirmed working on a real UE. Lives as a
+> second tab on the SMS/MMS page, not a separate nav entry.
+> `ENABLE_MMS_MODULE` defaults **disabled** (opt-in).
+
+### Components
+
+- **VectorCore MMSC** — the real MM1 (UE↔MMSC) message-relay backend
+- **`mm1-msisdn-proxy.go`** — a small, compiled-Go reverse proxy this
+  project builds and runs in front of VectorCore's public MM1 port, its own
+  dedicated `vectorcore-mm1-proxy` systemd unit
+
+### Why the proxy exists
+
+Real phones send MMS PDUs with no usable `From` field — VectorCore expects
+a GGSN/PGW-style `X-MSISDN` HTTP header to identify the sender instead. The
+proxy resolves the sending subscriber's MSISDN from their Framed-Routing UE
+IP and injects that header before forwarding to VectorCore's real `:8002`.
+
+### Real bugs found getting this working
+
+- VectorCore logs its entire MM1 request path at `Debug` level while
+  shipping configured at `Info` — looked exactly like requests weren't
+  reaching the app at all until the log level was corrected
+- Real phones' missing `From` field (see proxy rationale above) — without
+  the injected `X-MSISDN` header, VectorCore has no way to attribute an
+  inbound MMS to a sender
+
+### Workflow
+
+1. **Install** — installs VectorCore MMSC and builds/deploys the MSISDN
+   proxy from the same already-guaranteed Go toolchain this project uses
+   elsewhere (deliberately not Node, which isn't a documented prerequisite)
+2. **Configure** — wires the proxy's target MM1 IP/port and Framed-Routing
+   lookup
+3. Full lifecycle control (Start/Stop/Restart) for both VectorCore and the
+   proxy's own systemd unit
 
 ---
 

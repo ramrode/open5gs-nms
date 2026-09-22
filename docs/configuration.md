@@ -335,7 +335,7 @@ sepp:
         - uri: http://127.0.0.200:7777
   n32:
     server:
-      - sender: sepp1.5gc.mnc070.mcc999.3gppnetwork.org
+      - sender: sepp1.5gc.mnc001.mcc001.3gppnetwork.org
         scheme: http               # or https for mutual-TLS
         address: 127.0.1.250
         port: 7777

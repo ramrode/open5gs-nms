@@ -177,11 +177,8 @@ sudo apt update && sudo apt install -y \
   libnghttp2-dev libsctp-dev lksctp-tools flex bison libssl-dev \
   libtalloc-dev libcurl4-openssl-dev uuid-dev liblz4-dev
 
-# Clone repository
-If you have not already cloned the github repo then
-git clone https://github.com/open5gs/open5gs
-
-Otherwise we can move to the project folder.
+# Clone repository (skip if you already have it)
+[ -d open5gs ] || git clone https://github.com/open5gs/open5gs
 cd open5gs
 
 # Configure and build
@@ -597,7 +594,7 @@ docker exec open5gs-nms-backend systemctl status open5gs-nrfd
 
 1. **Check audit logs:**
    ```bash
-   tail -f /opt/open5gs-nms/logs/audit/*.log
+   tail -f /opt/open5gs-nms/logs/audit.json
    ```
 
 2. **Verify YAML syntax:** Use the text editor mode to check for syntax errors and review the validation output in the preview pane.

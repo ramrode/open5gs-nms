@@ -4,6 +4,47 @@ All notable changes to open5gs-nms are documented here.
 
 ---
 
+## [v2.0-beta_0.62] - 2026-09-22
+
+### Docs — full accuracy pass across every markdown file in the repo
+
+- Corrected a repo-wide stale reference to a since-removed separate WebSocket
+  port (3002) — the WebSocket upgrade has shared the REST port since
+  v2.0-beta_0.4 — across README, ARCHITECTURE, api-reference, requirements,
+  deployment, development, troubleshooting, and CONTRIBUTING.
+- ARCHITECTURE.md's Security Limitations section claimed no multi-user
+  support/RBAC exists — false; real admin/viewer role-based access control
+  is enforced on every route. Rewritten to describe what's actually there.
+- docs/api-reference.md was missing roughly half the app's real API
+  namespaces from its module table — added them all.
+- docs/features.md had zero coverage of the MMS module — added a full
+  section.
+- VECTORCORE_UPSTREAM_PATCHES.md documented 2 of 6 real, currently-applied
+  upstream patches — added full writeups for the other 4 from the actual
+  patch source.
+- THIRD_PARTY_NOTICES.md had no attribution at all for Osmocom, Kamailio,
+  Asterisk, PyHSS, or SigScale OCS despite them being core runtime
+  dependencies — added all five, with license info verified from local
+  source/package files rather than assumed.
+- Fixed a stale test-plan PLMN, several broken example commands, dead
+  `docker-compose.prod.yml`/fake version-tag references, unfilled
+  `YOUR_ORG` placeholders, and a missing FRR eigrpd operational warning
+  (the naive restart path triggers the known crash; the live `vtysh`
+  method doesn't) across INSTALL.md and the rest of docs/.
+- Removed `docs/vectorcore-epdg-integration-plan.md` (an implementation
+  plan already shipped) and the orphaned root-level
+  `open5gs-network-topology.svg` (confirmed zero references first).
+
+### Docs — screenshots for every section added since the last screenshot pass
+
+- Added real screenshots for PSTN/Voice Gateway, 2G GSM, 3G UMTS, RF
+  Planning, IP Plan Tool, RAN Kill Switches, SigScale OCS, Charging Plans,
+  and Call History (CDR).
+- The Call History screenshot contained a real personal phone number
+  across 9 cells — found and redacted before publishing.
+
+---
+
 ## [v2.0-beta_0.61] - 2026-09-21
 
 ### Added — IP Plan Tool: bulk re-addressing via explicit Propose → Review → Apply
@@ -106,6 +147,24 @@ All notable changes to open5gs-nms are documented here.
 - Every subscriber's own real MSISDN is now internally dialable system-wide,
   auto-routed to IMS or 2G by their own provisioned state, alongside their
   existing extension short codes, with zero changes to any existing short code.
+
+### Fixed — 2G call setup: hardcoded MNCC timer, and no route to external PSTN
+
+- `osmo-sip-connector`'s `MNCC_SETUP_COMPL_IND` had a hardcoded 5s timeout that
+  a real over-the-air CONNECT round trip could legitimately exceed under normal
+  GSM scheduling, tearing down a call both legs had just marked connected.
+  Widened to 15s for just that call site; baked into the module's own build
+  pipeline so a reinstall picks it up too.
+- Asterisk-2G's dialplan had no real route to the external PSTN trunk — a 2G
+  subscriber dialing a genuine external number silently looped back into
+  `osmo-msc` as an unrecognized-subscriber request instead of ever reaching
+  PSTN. Fixed by routing anything that isn't a known subscriber's own MSISDN
+  out through the PSTN Gateway's trunk instead.
+- `radio-link-timeout` raised from 32 to 64 (osmo-bsc's real configurable max)
+  as a mitigation for a real, intermittent 2G radio-link reliability problem
+  found on real hardware — **not fully resolved**; if a 2G call still fails
+  intermittently, this is very likely the BTS's own hardware/RF condition,
+  not something fixable in this project's code.
 
 ---
 
