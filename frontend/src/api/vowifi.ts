@@ -84,7 +84,11 @@ export interface VectorcoreSession {
   state: string;
   ike_sa: { spi_i: string; spi_r: string };
   child_sa: { esp_spi_in: string; esp_spi_out: string };
-  s2b: { pgw: string; control_teid: number; data_teid: number };
+  // Nullable at the source (Go `*S2BDetail` with `json:"s2b,omitempty"`) —
+  // the key is omitted entirely while a session's S2b/PGW GTP-C handshake
+  // hasn't completed yet (IKE_AUTH finishes first, S2b is a separate step
+  // after). A session in that window has no s2b at all, not an empty one.
+  s2b?: { pgw: string; control_teid: number; data_teid: number };
 }
 
 // GET /api/v1/clients/{imsi}/diag — per-bearer traffic counters + timestamps, fetched

@@ -555,7 +555,9 @@ function LiveSessionsTab({ enabled }: { enabled: boolean }) {
                         {s.state}
                       </span>
                     </td>
-                    <td className="py-1.5 font-mono text-nms-text-dim text-[11px]">{s.s2b.pgw} ({s.s2b.control_teid} / {s.s2b.data_teid})</td>
+                    <td className="py-1.5 font-mono text-nms-text-dim text-[11px]">
+                      {s.s2b ? `${s.s2b.pgw} (${s.s2b.control_teid} / ${s.s2b.data_teid})` : <span className="text-amber-400">S2b pending…</span>}
+                    </td>
                     <td className="py-1.5 text-right">
                       <button onClick={() => toggleDetails(s.imsi)} className="nms-btn-ghost text-[11px] flex items-center gap-1 px-2 py-1 ml-auto">
                         <Info className="w-3 h-3" /> {expandedImsi === s.imsi ? 'Hide' : 'Details'}

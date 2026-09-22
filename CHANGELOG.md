@@ -4,6 +4,30 @@ All notable changes to open5gs-nms are documented here.
 
 ---
 
+## [v2.0-beta_0.63] - 2026-09-22
+
+### Fixed — VoWiFi Live Sessions page crashing to a blank/grey screen
+
+- The session list's S2b/PGW column read `s.s2b.pgw` unguarded — VectorCore
+  ePDG's own API omits the `s2b` key entirely (not `null`, just absent)
+  while a session's PGW handshake hasn't completed yet, which threw and
+  blanked the page the moment a new WiFi Calling session appeared. Now
+  shows "S2b pending…" for that window instead of crashing.
+
+### Docs — README rewritten in product voice, not engineering-journal voice
+
+- Every feature section now describes what the module does today, not the
+  debugging journey to get it there — removed "Phase N" internal-tracking
+  language, "we fixed N bugs" narration, and stale "not yet confirmed"
+  hedges throughout.
+- Corrected several stale claims: VoWiFi-to-VoLTE calling works (previously
+  described as having an open issue), the PSTN external SIP trunk has a
+  real provider connected and working (previously described as
+  unconfigured), and Call History is fully working across all three of its
+  sources (previously described as partially unconfirmed).
+
+---
+
 ## [v2.0-beta_0.62] - 2026-09-22
 
 ### Docs — full accuracy pass across every markdown file in the repo

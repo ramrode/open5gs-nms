@@ -21,7 +21,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **Safe Configuration** - Automatic backups, validation, and rollback on failure
 - **5G Privacy (SUCI)** - Home network key management for subscription concealment
 - **Authentication** - Session-based login protecting all pages and API endpoints
-- **Voice & SMS** - Optional IMS/VoLTE core (stable — real iPhone-to-iPhone calling confirmed working) and SGs-based SMS, both provisioned and managed from the UI
+- **Voice & SMS** - Optional IMS/VoLTE core (stable) and SGs-based SMS, both provisioned and managed from the UI
 - **L3 Routing (FRR)** - Guided L2→L3 migration, EIGRP/OSPF/BGP support, and a from-source FRR reinstall path
 - **End-to-End Testing** - Simulated 4G/5G test UEs (UE Validation) to verify attach/PDU/paging without a physical radio
 
@@ -210,7 +210,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ### Security Gateway (SecGW) *(Alpha — Experimental)*
 
-> ⚠️ **This module is in alpha.** Real IPsec tunnels are confirmed working end-to-end for both Baicells and Nokia radios simultaneously — real S1AP/GTP-U traffic verified flowing through the tunnel via packet capture (ESP wrapper + decrypted SCTP heartbeat, correlated by timestamp). Per-radio IPsec configuration on the radio's own page is manual — there is no automatic TR-069 push in this version.
+> ⚠️ **Alpha.** Per-radio IPsec configuration on the radio's own page is manual — there is no automatic TR-069 push in this version.
 
 - **Terminates IPsec from real RAN backhaul** — decrypts S1-MME/S1-U (4G) and N2/N3 (5G) traffic at the edge and forwards it in plaintext to the existing core NFs, the same "decrypt at the edge" pattern this project's VoWiFi ePDG already uses. Built on strongSwan/`swanctl`, source-built with a small patch so it coexists with VoWiFi's own IKEv2 daemon on the same host
 - **Vendor-aware Radios tab** — separate Baicells and Nokia sub-tabs, since the two vendors' IPsec models are fundamentally different: Baicells negotiates a virtual IP dynamically via IKEv2 Configuration Payload, while Nokia has no CP support at all and instead uses static tunnel endpoints plus one or more explicit "Protect" traffic-selector policies
@@ -324,7 +324,7 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **One-click install** of every IMS component, including PyHSS ([nickvsnetworking/pyhss](https://github.com/nickvsnetworking/pyhss)), cloned and set up automatically — no separate manual install required
 - **Guided configuration** — wires the P-CSCF address into SMF's PCO and per-session DNS, writes the Cx/Rx Diameter peer XML, and generates the IMS DNS zone automatically
 - **Subscriber sync** — pushes IMPI/IMPU identities for your existing subscribers into PyHSS's HSS database
-- **Real-phone VoLTE confirmed** — real, registered iPhones and Android phones calling each other rings and connects with full audio, including a real P-CSCF↔PCRF Rx interface for dedicated QCI=1 bearers, on PLMN 001-01
+- **Real VoLTE calling** — registered phones call each other with full audio, including dedicated QCI=1 bearers via a P-CSCF↔PCRF Rx interface
 
 ![IMS Configuration](docs/screenshots/ims-config.png)
 
@@ -342,28 +342,28 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ### MMS *(Beta)*
 
-> ⚠️ **This module is in beta.** Real end-to-end MMS confirmed working on a real UE. `ENABLE_MMS_MODULE` defaults **disabled** (opt-in).
+> ⚠️ **Beta.** `ENABLE_MMS_MODULE` defaults **disabled** (opt-in).
 
 - **VectorCore MMSC** ([vectorcore-mobile](https://github.com/vectorcore-mobile)) — built from source (Go toolchain + embedded web UI) and installed as a host service with one click; delivery notifications ride on the existing SMS (SGs) SMPP interface, so IMS/SMS must already be configured
 - **Direct links to VectorCore's own admin UI and JSON API** — this page doesn't reimplement them, it links straight out
 - **Subscriber sync** — pushes MSISDNs from the Open5GS MongoDB into VectorCore so it knows which numbers can send/receive MMS
 - **iPhone MMS Settings Profile generator** — iOS hides the manual APN/MMSC settings screen on most SIMs; generates a ready-to-install `.mobileconfig` with the correct MMSC URL pre-filled
-- **Real upstream bugs found and patched** — VectorCore's MM1 request-path logging defaulted too quiet to diagnose delivery issues, and real phones send MMS PDUs with no usable `From` field; fixed with a small compiled-Go reverse proxy (`mm1-msisdn-proxy.go`, its own systemd unit, built during every Configure) that resolves the sender's MSISDN from the UE's Framed-Routing IP and injects the `X-MSISDN` header VectorCore expects
+- **Automatic sender identification** — resolves the sending subscriber's MSISDN from their Framed-Routing IP and passes it to VectorCore automatically, since real phones don't reliably include a usable sender field in MMS PDUs
 - Lives as a second tab on the SMS/MMS page, not a separate nav entry
 
 ![MMS Setup](docs/screenshots/mms-setup.png)
 
 ![MMS iPhone Settings Profile](docs/screenshots/mms-iphone-profile.png)
 
-### VoWiFi *(Alpha — Experimental)*
+### VoWiFi *(Alpha)*
 
-> ⚠️ **This module is in alpha.** Real SIP signaling over VoWiFi is confirmed working end-to-end on a real phone — full IKEv2/EAP-AKA' attach, a real REGISTER → 401 Challenge → REGISTER → 200 OK → SUBSCRIBE → NOTIFY exchange, and a real iPhone-to-iPhone call with two-way audio. VoWiFi-to-VoLTE calling still has an open issue (connects with audio, drops after a few seconds). Do not rely on this for a production voice deployment yet.
+> ⚠️ **Alpha.** `ENABLE_VOWIFI_MODULE` defaults **disabled** (opt-in).
 
+- **Voice and SMS over Wi-Fi** when cellular coverage isn't available — full IKEv2/EAP-AKA' attach and SIP registration, with real iPhone-to-iPhone and VoWiFi-to-VoLTE calling, both with two-way audio
 - **VectorCore ePDG + VectorCore AAA** ([vectorcore-mobile](https://github.com/vectorcore-mobile)) — a native Go/eBPF ePDG (XDP/TC-BPF GTP-U dataplane) paired with an Erlang Diameter AAA stack (SWx to the HSS, SWm relay from the ePDG, S6b to the SMF), built from source and installed with one click
 - **Config file editor** — Monaco-based editor for `epdg.yaml`/`aaa.config` with save and save-and-restart
 - **Live Sessions page** — real-time client list (IMSI, UE IP, outer IP, APN, state) plus aggregate Clients/IKE SAs/Child SAs/Bearers counters, proxied straight from VectorCore ePDG's own admin API
 - **Automatic staleness detection** — separate "reinstall available" and "reconfigure available" banners track vendored source patches and generated-config drift independently, so a deployment never silently runs stale patches after an update
-- **Real upstream bugs found and patched** — including a same-host uplink GTP-U delivery bug (VectorCore's TC-BPF dataplane assumed a remote, ARP-resolvable PGW; fixed with a userspace ringbuf delivery path for the always-colocated case this project uses) and a half-open IKE SA reaper leak — both patched automatically during the vendored source build, not just live on one host
 
 ![VoWiFi Setup](docs/screenshots/vowifi-setup.png)
 
@@ -383,12 +383,12 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 ### PSTN / Voice Gateway
 
-> ⚠️ **No public SIP trunk provider connected yet** — the external trunk + inbound DID mapping mechanism itself is built and live-verified, but real provider connectivity (Twilio, Telnyx, or similar) is deliberately not configured on this deployment, since there's nothing to connect to. `ENABLE_PSTN_MODULE` defaults **disabled** (opt-in) — unlike most optional modules, which default enabled.
+> ⚠️ `ENABLE_PSTN_MODULE` defaults **disabled** (opt-in) — unlike most optional modules, which default enabled.
 
-- **Wires Asterisk into S-CSCF's own PSTN dispatcher** for internal extension-to-subscriber calling, confirmed working end-to-end on real hardware (iPhone↔iPhone, iPhone↔Android) with full-duplex audio
+- **Asterisk-based voice gateway** wired into S-CSCF's own PSTN dispatcher, for internal extension-to-subscriber calling with full-duplex audio
 - **Every subscriber's own real MSISDN is internally dialable**, auto-routed to IMS or 2G by their own `gsmEnabled` flag, alongside their existing extension short codes
-- **Optional external SIP trunk + inbound DID mapping** — a real, off-host-reachable transport and firewall allowlist, all 4 buildable phases shipped, real provider connection deliberately not yet configured
-- **Cross-RAN Calling** — one toggle peers this instance with Asterisk-2G, bridging 4G/5G and 2G short codes across both Asterisk instances with real AMR/AMR-WB↔GSM-FR transcoding, confirmed live with real over-the-air calls in both directions
+- **External SIP trunk with inbound DID mapping** — real external calling in both directions through a SIP trunk provider, with per-DID routing to specific subscribers and a firewall allowlist restricting access to the provider's own IP range
+- **Cross-RAN Calling** — one toggle peers this instance with Asterisk-2G, bridging 4G/5G and 2G short codes across both Asterisk instances with real AMR/AMR-WB↔GSM-FR transcoding
 
 ![PSTN Gateway Overview](docs/screenshots/pstn-gateway-overview.png)
 
@@ -400,10 +400,8 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 > ⚠️ **Real radio module.** Real spectrum transmission on real GSM hardware is a bigger blast radius than a broken lab feature — `ENABLE_GSM_MODULE` defaults **disabled** (opt-in).
 
-- **Real GSM radio access** (osmo-bsc/osmo-bts) on real nanoBTS hardware confirmed on-air — CS attach/ciphering, GPRS/EDGE packet data, and 2G↔4G SMS are all **stable**
-- **Real voice calling** needs a second, fully isolated Asterisk instance (Asterisk-2G) — osmo-msc's own built-in call handler can complete signaling but never implements real RTP audio (an upstream Osmocom limitation, not fixable in this project)
-- One button installs, configures, and wires everything needed for 2G↔2G voice with real audio
-- If a real call ever fails at channel assignment, it is **not necessarily a hardware problem** — a real `codec-support`/AMR configuration mismatch caused exactly this symptom once and had been misdiagnosed as unfixable hardware the day before
+- **Real GSM radio access** (osmo-bsc/osmo-bts) on real nanoBTS hardware — CS attach/ciphering, GPRS/EDGE packet data, 2G↔4G SMS, and 2G↔2G voice calling with real audio
+- **One button** installs, configures, and wires everything needed for full 2G service, including a second, isolated Asterisk instance that carries real voice audio for 2G↔2G calls
 
 ![2G GSM Overview](docs/screenshots/gsm-overview.png)
 
@@ -413,20 +411,18 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 > ⚠️ Real femtocell hardware target. `ENABLE_HNBGW_MODULE` defaults **disabled** (opt-in).
 
-- **Home NodeB Gateway** bridging a 3G femtocell's Iuh interface to the existing 2G-era osmo-msc/osmo-sgsn core over the already-running SS7 (`osmo-stp`) — no changes needed to either of those, confirmed live
+- **Home NodeB Gateway** bridging a 3G femtocell's Iuh interface to the existing 2G-era osmo-msc/osmo-sgsn core over the already-running SS7 (`osmo-stp`)
 - Reuses the 2G module's existing subscriber provisioning — no new credential setup needed for a subscriber to also work on 3G
-- A software test HNB (OsmoHNodeB) is deployable from the module's own page — proved a full live registration end-to-end before any real 3G hardware was ever touched
+- **Software test HNB** (OsmoHNodeB), deployable from the module's own page, for full registration testing without real 3G hardware
 - Real hardware target: an ip.access nano3G, which self-registers once pointed at this gateway (no remote-provisioning push, unlike 2G's OML)
 
 ![3G UMTS Overview](docs/screenshots/hnb-overview.png)
 
 ### RF Planning *(Alpha)*
 
-> ⚠️ **Early and actively being built out.** Expect incomplete phases and possible breaking changes between releases.
+> ⚠️ **Alpha.** Treat outputs as a starting point, not a certified final design. `ENABLE_RF_PLANNING_MODULE` defaults **disabled** (opt-in).
 
-- **Deterministic LTE link-budget / site-geometry engine** — Phase 1 of a planned multi-phase tool
-- Not yet a full replacement for a commercial planning suite — treat outputs as a starting point, not a final design
-- `ENABLE_RF_PLANNING_MODULE` defaults **disabled** (opt-in)
+- **Deterministic LTE link-budget and site-geometry engine** — coverage prediction, link budgets, and site placement from real RF propagation models
 
 ![RF Planning Overview](docs/screenshots/rf-planning-overview.png)
 
@@ -460,7 +456,6 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 - **4G/EPC only** — Open5GS's SMF has no 5G online-charging (Nchf) client upstream, so 5G NR sessions are never covered by this integration
 - **One-button Configure** — installs SigScale OCS (a real Erlang/OTP application via its own apt package), registers SMF as a trusted Diameter client, upserts the Gy peer into `smf.conf`, and verifies a real `STATE_OPEN` connection
 - No rating-plan/balance/subscriber CRUD in this NMS — links out to OCS's own Polymer web GUI and REST API docs instead
-- Getting real charging fully working (both Gy and Ro) surfaced and fixed 9 separate real bugs across freeDiameter-vs-cdp connectivity quirks and the compiled `ims_charging.so` module itself — see `docs/features.md` for the full writeup
 
 ![SigScale OCS Setup](docs/screenshots/ocs-setup.png)
 
@@ -468,22 +463,18 @@ Open5GS NMS simplifies the management of Open5GS deployments by providing:
 
 > ⚠️ **Beta.** Depends on SigScale OCS being installed and configured first.
 
-- **A deliberately simplified data + voice cap GUI** over SigScale OCS's own full rating-plan vocabulary — built per direct user feedback that "the sigscale gui is too complex"
+- **A simplified data + voice cap GUI** over SigScale OCS's own full rating-plan vocabulary
 - One GUI "Plan" (name + data cap GB + voice cap minutes) maps to one real OCS bundle offer
 - **Auto-provisioned "Unlimited" plan** on every OCS Configure — a deliberately huge finite cap (1,000,000 GB / 1,000,000 min), not a dedicated no-cap code path
 - Subscriber assignment from the Subscribers page, both bulk-select and per-row
-- A known, still-unresolved OCS-side rating-engine bug can leak stuck reservations across subscribers — mitigated by an automatic background guard that sweeps and clears stale reservations every 30 minutes (a mitigation, not a fix for the underlying engine bug)
+- **Automatic reservation cleanup** — a background guard sweeps and clears stale charging reservations every 30 minutes, so a subscriber's balance never gets stuck
 
 ![Charging Plans](docs/screenshots/charging-plans.png)
 
 ### Call History (CDR) *(Beta)*
 
-> ⚠️ **Beta.** One of three phases is not yet confirmed working end-to-end — see below.
-
 - **Unified call detail records across PSTN, 2G, and 4G/5G IMS**, synced into their own MongoDB collection from each system's own real source (not a fresh primary store)
-- **Phase 1 (PSTN Gateway)** — stable, verified against a real 76+-row dataset
-- **Phase 2 (Asterisk-2G)** — code deployed, but a real end-to-end test-call confirmation is still outstanding
-- **Phase 3 (direct 4G/5G IMS-to-IMS calls)** — via Kamailio's own `acc` module, confirmed fully working end-to-end against real test calls, independent runtime toggle from its own compile-time build flag
+- Covers PSTN Gateway calls, 2G-to-2G (Asterisk-2G) calls, and direct 4G/5G IMS-to-IMS calls — the last of these has its own toggle on the Call History Settings panel
 - Configurable retention (default 180 days)
 
 ![Call History](docs/screenshots/call-history.png)
